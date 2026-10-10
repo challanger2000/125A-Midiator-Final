@@ -1,0 +1,157 @@
+name: Midiator V1.0.0 Demo Final QA
+
+on:
+  push:
+    branches:
+      - demo/v1.0.0-2026-10-10
+    paths:
+      - ".github/workflows/demo-v1.0.0-final.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: midiator-v1-demo-final
+  cancel-in-progress: true
+
+jobs:
+  final-qa:
+    runs-on: windows-2022
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build exact Demo and focused Demo QA
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --target Midiator MidiatorDemoTimerTests MidiatorDemoProcessorTests validator --parallel
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run focused 30-second Demo QA
+        shell: pwsh
+        run: |
+          ctest --test-dir build -C Release --output-on-failure -R "MidiatorDemo(Timer|Processor)Tests" -V
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Stage exact Demo VST3
+        id: midiator
+        shell: pwsh
+        run: |
+          $artifact = "$env:GITHUB_WORKSPACE\artifact"
+          New-Item -ItemType Directory -Force -Path $artifact | Out-Null
+
+          $bundles = Get-ChildItem "$env:GITHUB_WORKSPACE\build" -Recurse -Directory -Filter "Midiator.vst3" -ErrorAction SilentlyContinue
+          $p = $bundles | Where-Object { Test-Path (Join-Path $_.FullName "Contents") } | Select-Object -First 1
+          if (-not $p) { throw "Midiator.vst3 built bundle not found" }
+
+          $final = Join-Path $artifact "125A Midiator.vst3"
+          Copy-Item $p.FullName $final -Recurse -Force
+
+          $archDir = Join-Path $final "Contents\x86_64-win"
+          $source = Join-Path $archDir "Midiator.vst3"
+          $target = Join-Path $archDir "125A Midiator.vst3"
+          if (-not (Test-Path -PathType Leaf $source)) { throw "Built VST3 binary missing" }
+          Rename-Item $source "125A Midiator.vst3"
+
+          foreach ($name in @("midiator.uidesc", "125A_Logo.png", "moduleinfo.json")) {
+            if (-not (Test-Path -PathType Leaf (Join-Path $final "Contents\Resources\$name"))) {
+              throw "Missing release resource: $name"
+            }
+          }
+
+          $uidesc = Get-Content -Raw (Join-Path $final "Contents\Resources\midiator.uidesc")
+          if ($uidesc -notmatch 'title="DEMO"') { throw "Visible DEMO badge missing" }
+
+          $moduleInfo = Get-Content -Raw (Join-Path $final "Contents\Resources\moduleinfo.json")
+          if ($moduleInfo -notmatch '"Version"\s*:\s*"1\.0\.0"') { throw "Version 1.0.0 missing" }
+
+          "plugin=$final" >> $env:GITHUB_OUTPUT
+
+      - name: Steinberg Validator
+        shell: pwsh
+        env:
+          MIDIATOR_PLUGIN: ${{ steps.midiator.outputs.plugin }}
+        run: |
+          $validator = Get-ChildItem -Path build -Recurse -File -Filter validator.exe | Select-Object -First 1
+          if (-not $validator) { throw "Steinberg validator.exe not found" }
+          & $validator.FullName "$env:MIDIATOR_PLUGIN"
+          if ($LASTEXITCODE -ne 0) { throw "Steinberg Validator failed: $LASTEXITCODE" }
+
+      - name: Checkout current 125A Plugin Tester
+        uses: actions/checkout@v5
+        with:
+          repository: challanger2000/125A-Plugin-Tester-Final
+          ref: main
+          path: qa-tester
+
+      - name: Build current 125A release QA
+        shell: pwsh
+        run: |
+          cmake -S qa-tester -B qa-tester-build -G "Visual Studio 17 2022" -A x64 -DSMTG_CREATE_PLUGIN_LINK=0
+          cmake --build qa-tester-build --config Release --target PluginTester125ADispatcher PluginTester125ALauncher PluginTester125AWorker PluginTester125AReloadProbe PluginTester125AStateProbe PluginTester125AEditorLifecycleProbe PluginTester125AIOEventProbe PluginTester125AValidatorWrapper validator --parallel
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run complete 125A release QA with quoted bundle path
+        shell: pwsh
+        env:
+          MIDIATOR_PLUGIN: ${{ steps.midiator.outputs.plugin }}
+        run: |
+          $tester = Get-ChildItem "qa-tester-build" -Recurse -File -Filter "125A_Plugin_Tester.exe" | Select-Object -First 1
+          if (-not $tester) { throw "125A_Plugin_Tester.exe not found" }
+
+          $env:125A_PLUGIN_TESTER_REPORT_DIR = Join-Path (Get-Location) "build\125a-release-qa"
+          Remove-Item $env:125A_PLUGIN_TESTER_REPORT_DIR -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $env:125A_PLUGIN_TESTER_REPORT_DIR | Out-Null
+
+          $quotedPlugin = '"' + $env:MIDIATOR_PLUGIN + '"'
+          $process = Start-Process -FilePath $tester.FullName -ArgumentList $quotedPlugin -Wait -PassThru
+          Write-Host "125A Plugin Tester exit code: $($process.ExitCode)"
+
+          Get-ChildItem $env:125A_PLUGIN_TESTER_REPORT_DIR -File | ForEach-Object {
+            Write-Host "REPORT: $($_.Name)"
+          }
+
+          $qa = Get-ChildItem $env:125A_PLUGIN_TESTER_REPORT_DIR -File -Filter "*_125A_QA_Report.txt" | Select-Object -First 1
+          $json = Get-ChildItem $env:125A_PLUGIN_TESTER_REPORT_DIR -File -Filter "*_125A_QA_Report.json" | Select-Object -First 1
+          $io = Get-ChildItem $env:125A_PLUGIN_TESTER_REPORT_DIR -File -Filter "*_125A_IO_Event_Probe.txt" | Select-Object -First 1
+          $editor = Get-ChildItem $env:125A_PLUGIN_TESTER_REPORT_DIR -File -Filter "*_125A_Editor_Lifecycle_Probe.txt" | Select-Object -First 1
+          $validator = Get-ChildItem $env:125A_PLUGIN_TESTER_REPORT_DIR -File -Filter "*_125A_Steinberg_Validator.txt" | Select-Object -First 1
+
+          foreach ($required in @($qa,$json,$io,$editor,$validator)) {
+            if (-not $required) { throw "Required 125A QA report missing after quoted-path launch" }
+          }
+
+          $qaText = Get-Content $qa.FullName -Raw
+          $jsonData = Get-Content $json.FullName -Raw | ConvertFrom-Json
+          $ioText = Get-Content $io.FullName -Raw
+          $editorText = Get-Content $editor.FullName -Raw
+
+          Write-Host $qaText
+          Write-Host $ioText
+          Write-Host $editorText
+
+          if ($process.ExitCode -ne 0) { throw "125A Plugin Tester failed with $($process.ExitCode)" }
+          if ($jsonData.status -ne "PASS") { throw "125A QA JSON status was $($jsonData.status)" }
+          if (-not $qaText.Contains("0 WARNING / 0 FAIL")) { throw "125A QA report not clean" }
+          if (-not $editorText.Contains("Result: PASS")) { throw "Editor Lifecycle Probe did not PASS" }
+          if (-not $ioText.Contains("Result: PASS")) { throw "I/O Event Probe did not PASS" }
+
+      - name: Upload exact tested Demo VST3
+        uses: actions/upload-artifact@v5
+        with:
+          name: 125A-Midiator-v1.0.0-Windows-x64-Demo-VST3
+          path: artifact
+          if-no-files-found: error
+
+      - name: Upload final Demo QA reports
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: 125A-Midiator-v1.0.0-Final-Demo-QA
+          path: build/125a-release-qa/*
+          if-no-files-found: warn
