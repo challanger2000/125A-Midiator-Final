@@ -5,6 +5,7 @@
 #include "DrumBrain.h"
 #include "PadBrain.h"
 #include "SynthBrain.h"
+#include "DemoTimer.h"
 
 #include "public.sdk/source/vst/vstaudioeffect.h"
 #include "public.sdk/source/vst/vsteditcontroller.h"
@@ -149,6 +150,7 @@ private:
     uint32_t seed_ = 0x125A2026u;
 
     double sampleRate_ = 44100.0;
+    midiator::DemoTimer demoTimer_{};
     bool wasPlaying_ = false;
     bool haveExpectedProjectTime_ = false;
     double expectedProjectTimeQn_ = 0.0;
