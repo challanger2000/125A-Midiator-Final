@@ -1,0 +1,12 @@
+# 125A Midiator V1.0.0 - local output only
+/build/
+/out/
+/artifact/
+/.vs/
+/.idea/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+__pycache__/
+*.pyc
