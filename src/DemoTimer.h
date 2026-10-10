@@ -63,7 +63,7 @@ public:
     }
 
 private:
-    bool licensed_ {false};
+    bool licensed_ {true};
     double sampleRate_ {44100.0};
     std::uint64_t limitSamples_ {1323000u};
     std::uint64_t elapsedSamples_ {0u};
