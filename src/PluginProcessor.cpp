@@ -626,6 +626,10 @@ tresult PLUGIN_API MidiatorProcessor::initialize(FUnknown* context) {
     addEventOutput(STR16("Drums Out"),  1, kAux,  BusInfo::kDefaultActive);
     addEventOutput(STR16("Pad Out"),    1, kAux,  BusInfo::kDefaultActive);
     addEventOutput(STR16("Synth Out"),  1, kAux,  BusInfo::kDefaultActive);
+
+    // Public V1.0.0 Demo build: fixed 30 seconds of actual valid playback.
+    // The released FULL binary remains a separate frozen, already-validated build.
+    demoTimer_.configure(sampleRate_, false);
     return kResultOk;
 }
 
@@ -2130,6 +2134,7 @@ tresult PLUGIN_API MidiatorProcessor::process(ProcessData& data) {
 tresult MidiatorProcessor::processBlock(ProcessData& data) {
     if (data.processContext && data.processContext->sampleRate > 0.0)
         sampleRate_ = data.processContext->sampleRate;
+    demoTimer_.setSampleRate(sampleRate_);
 
     // GUI IConnectionPoint messages, parameter queues and MIDI-root NoteOns all
     // describe the final musical state for this audio block. Consume the GUI
