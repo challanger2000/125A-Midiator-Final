@@ -78,7 +78,6 @@ ProcessContext makeContext(
     context.state =
         ProcessContext::kTempoValid |
         ProcessContext::kProjectTimeMusicValid |
-        ProcessContext::kProjectTimeSamplesValid |
         ProcessContext::kBarPositionValid |
         ProcessContext::kTimeSigValid |
         ProcessContext::kPlaying;
