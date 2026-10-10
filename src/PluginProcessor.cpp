@@ -609,6 +609,10 @@ MidiatorProcessor::MidiatorProcessor()
 
     // generateNew() already regenerates Bass -> Drums -> Pad -> Synth.
     generateNew();
+
+#if defined(MIDIATOR_DEMO_BUILD)
+    demoTimer_.configure(sampleRate_, false);
+#endif
 }
 
 tresult PLUGIN_API MidiatorProcessor::initialize(FUnknown* context) {
@@ -627,9 +631,6 @@ tresult PLUGIN_API MidiatorProcessor::initialize(FUnknown* context) {
     addEventOutput(STR16("Pad Out"),    1, kAux,  BusInfo::kDefaultActive);
     addEventOutput(STR16("Synth Out"),  1, kAux,  BusInfo::kDefaultActive);
 
-    // Public V1.0.0 Demo build: fixed 30 seconds of actual valid playback.
-    // The released FULL binary remains a separate frozen, already-validated build.
-    demoTimer_.configure(sampleRate_, false);
     return kResultOk;
 }
 
