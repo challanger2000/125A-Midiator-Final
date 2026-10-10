@@ -67,7 +67,7 @@ Dies ist das **maßgebliche, bereinigte Quellcode-Repository** für die freigege
 ## For maintainers / Für Entwickler
 
 - Use the **Final** repository as the authoritative home for future maintenance, first checking [CURRENT-RELEASE.md](CURRENT-RELEASE.md).
-- Develop new revisions on an appropriate **version branch**, **not directly on `main`**. Follow [125A Engineering — START-HERE](https://github.com/challanger2000/125A-Engineering/blob/main/START-HERE.md) and its mandatory standards.
+- Develop new revisions on an appropriate **version branch**, **not directly on `main`**. Authorized 125A maintainers also follow the **internal/private** Engineering repository and its mandatory `START-HERE.md`; public readers do not need access to that internal repository.
 - Windows builds can be generated with Visual Studio 2022 and the pinned Steinberg SDK as explained in [Build from source](docs/BUILD_FROM_SOURCE.md). GitHub Actions runs **only when manually dispatched**, to conserve build budget.
 - A fresh compilation or manually run CI job **does not automatically become the shipping V1.0.0 binary**. Passing source tests alone does not replace the original release QA and real DAW checks.
 - Only **Windows x64 VST3** is released. No macOS binary and no all-DAW MIDI routing guarantee.
