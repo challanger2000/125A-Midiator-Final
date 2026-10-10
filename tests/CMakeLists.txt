@@ -131,3 +131,10 @@ add_executable(MidiatorArrangementPropertyTests
 )
 target_include_directories(MidiatorArrangementPropertyTests PRIVATE ../src)
 add_test(NAME MidiatorArrangementPropertyTests COMMAND MidiatorArrangementPropertyTests)
+
+
+add_executable(MidiatorDemoTimerTests
+    DemoTimerTests.cpp
+)
+target_include_directories(MidiatorDemoTimerTests PRIVATE ../src)
+add_test(NAME MidiatorDemoTimerTests COMMAND MidiatorDemoTimerTests)
