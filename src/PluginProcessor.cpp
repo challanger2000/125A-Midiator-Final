@@ -2351,13 +2351,38 @@ tresult MidiatorProcessor::processBlock(ProcessData& data) {
         return flushed ? kResultOk : kResultFalse;
     }
 
+    const int32 demoAllowedSamples =
+        demoTimer_.allowedSamples(true, data.numSamples);
+
+    if (demoAllowedSamples <= 0) {
+        const bool flushed =
+            flushActiveNotes(
+                data.outputEvents,
+                currentPpq,
+                false,
+                0);
+
+        if (!flushed)
+            phraseChangedNeedsFlush_ = true;
+
+        return flushed ? kResultOk : kResultFalse;
+    }
+
+    const bool demoExpiresThisBlock =
+        demoAllowedSamples < data.numSamples;
+
     const double tempo = context->tempo;
     const double qnPerSample = tempo / (60.0 * sampleRate_);
     if (qnPerSample <= 0.0)
         return kResultOk;
 
     const double blockStartQn = context->projectTimeMusic;
-    const double blockEndQn = blockStartQn + static_cast<double>(data.numSamples) * qnPerSample;
+    const double fullBlockEndQn =
+        blockStartQn +
+        static_cast<double>(data.numSamples) * qnPerSample;
+    const double blockEndQn =
+        blockStartQn +
+        static_cast<double>(demoAllowedSamples) * qnPerSample;
 
     bool timelineJump = false;
     if (wasPlaying_ && haveExpectedProjectTime_) {
@@ -2382,7 +2407,7 @@ tresult MidiatorProcessor::processBlock(ProcessData& data) {
 
     wasPlaying_ = true;
     haveExpectedProjectTime_ = true;
-    expectedProjectTimeQn_ = blockEndQn;
+    expectedProjectTimeQn_ = fullBlockEndQn;
     const double patternLengthQn = static_cast<double>(phrase_.bars) * 4.0;
 
     if (patternLengthQn <= 0.0)
@@ -2408,7 +2433,7 @@ tresult MidiatorProcessor::processBlock(ProcessData& data) {
         e.sampleOffset = std::clamp<int32>(
             static_cast<int32>(std::floor(relSamples + 1e-9)),
             0,
-            std::max<int32>(0, data.numSamples - 1));
+            std::max<int32>(0, demoAllowedSamples - 1));
         e.ppqPosition = eventQn;
         e.noteOn = noteOn;
         e.pitch = std::clamp(pitch, 0, 127);
@@ -2847,9 +2872,25 @@ tresult MidiatorProcessor::processBlock(ProcessData& data) {
         }
     }
 
-    if (!applyTriggerTransitionsThrough(std::max<int32>(0, data.numSamples - 1))) {
+    if (!applyTriggerTransitionsThrough(
+            std::max<int32>(0, demoAllowedSamples - 1))) {
         phraseChangedNeedsFlush_ = true;
         return kResultFalse;
+    }
+
+    if (demoExpiresThisBlock) {
+        const double cutoffQn =
+            blockStartQn +
+            static_cast<double>(demoAllowedSamples) * qnPerSample;
+
+        if (!flushActiveNotes(
+                data.outputEvents,
+                cutoffQn,
+                false,
+                demoAllowedSamples)) {
+            phraseChangedNeedsFlush_ = true;
+            return kResultFalse;
+        }
     }
 
     return kResultOk;
