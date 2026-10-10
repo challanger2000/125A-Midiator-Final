@@ -6,7 +6,7 @@ int main() {
     using midiator::DemoTimer;
 
     DemoTimer demo;
-    demo.configure(1000.0, false);
+    demo.configure(2000.0, false);
 
     if (demo.allowedSamples(false, 5000) != 5000)
         return 1;
@@ -14,7 +14,7 @@ int main() {
     if (demo.allowedSamples(true, 10000) != 10000)
         return 2;
 
-    if (demo.allowedSamples(true, 19999) != 19999)
+    if (demo.allowedSamples(true, 49999) != 49999)
         return 3;
 
     if (demo.expired())
@@ -30,7 +30,7 @@ int main() {
         return 7;
 
     DemoTimer full;
-    full.configure(1000.0, true);
+    full.configure(2000.0, true);
 
     for (int i = 0; i < 100; ++i) {
         if (full.allowedSamples(true, 1024) != 1024)
