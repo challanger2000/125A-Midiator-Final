@@ -1,0 +1,3506 @@
+#include "PluginProcessor.h"
+#include "vstgui/lib/controls/cbuttons.h"
+#include "SectionProfiles.h"
+#include "TonalRetune.h"
+
+#include "public.sdk/source/main/pluginfactory.h"
+#include "public.sdk/source/vst/vstparameters.h"
+#include "pluginterfaces/vst/ivstevents.h"
+#include "pluginterfaces/vst/ivstparameterchanges.h"
+#include "pluginterfaces/vst/ivstprocesscontext.h"
+#include "vstgui/lib/controls/ctextlabel.h"
+#include "vstgui/lib/controls/ccontrol.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstring>
+#include <limits>
+
+namespace Steinberg::Vst {
+namespace {
+
+constexpr double kStepQuarterNotes = 0.25;
+constexpr int kMaxTriggerInputEvents = 2048;
+constexpr uint32_t kStateMagic = 0x4D445231u; // "MDR1"
+constexpr uint32_t kStateVersion = 17u;
+constexpr int kLegacyStateSteps = 128; // V1-V7 fixed phrase payload width
+constexpr const char* kMsgNewRiff = "125A.Midiator.NewRiff";
+constexpr const char* kMsgVariation = "125A.Midiator.Variation";
+constexpr uint32_t kControllerStateMagic = 0x4D445549u; // MDUI, separate from processor MDR1
+constexpr uint32_t kControllerStateVersion = 1u;
+constexpr std::array<double, 4> kGuiZoomLevels = {0.8, 1.0, 1.2, 1.5};
+
+template <typename T>
+bool writeValue(IBStream* stream, const T& value) {
+    if (!stream)
+        return false;
+    int32 written = 0;
+    return stream->write((void*)&value, static_cast<int32>(sizeof(T)), &written) == kResultOk &&
+           written == static_cast<int32>(sizeof(T));
+}
+
+template <typename T>
+bool readValue(IBStream* stream, T& value) {
+    if (!stream)
+        return false;
+    int32 read = 0;
+    return stream->read(&value, static_cast<int32>(sizeof(T)), &read) == kResultOk &&
+           read == static_cast<int32>(sizeof(T));
+}
+
+
+bool writePhraseState(IBStream* state, const midiator::Phrase& phrase) {
+    const int32 phraseBars = phrase.bars;
+    if (!writeValue(state, phraseBars))
+        return false;
+
+    for (int i = 0; i < midiator::kMaxSteps; ++i) {
+        const auto& step = phrase.steps[i];
+        const int32 noteCount = std::clamp(step.noteCount, 0, midiator::kMaxNotesPerStep);
+        if (!writeValue(state, noteCount))
+            return false;
+
+        for (int n = 0; n < midiator::kMaxNotesPerStep; ++n) {
+            const int32 pitch = step.notes[n].pitch;
+            const int32 velocity = step.notes[n].velocity;
+            const int32 lengthSteps = step.notes[n].lengthSteps;
+            if (!writeValue(state, pitch) || !writeValue(state, velocity) ||
+                !writeValue(state, lengthSteps))
+                return false;
+        }
+    }
+    return true;
+}
+
+bool readPhraseState(IBStream* state, midiator::Phrase& phrase, int fallbackBars,
+                     int serializedSteps, bool allow16Bars,
+                     bool strict = false) {
+    int32 phraseBars = 0;
+    if (!readValue(state, phraseBars))
+        return false;
+
+    const bool validLegacyBars =
+        phraseBars == 1 || phraseBars == 2 || phraseBars == 4 || phraseBars == 8;
+    const bool validBars = validLegacyBars || (allow16Bars && phraseBars == 16);
+    if (strict && !validBars)
+        return false;
+    if (serializedSteps < 1 || serializedSteps > midiator::kMaxSteps)
+        return false;
+
+    phrase.bars = validBars ? phraseBars : fallbackBars;
+    for (auto& step : phrase.steps)
+        step = {};
+
+    for (int i = 0; i < serializedSteps; ++i) {
+        int32 noteCount = 0;
+        if (!readValue(state, noteCount))
+            return false;
+        if (strict && (noteCount < 0 || noteCount > midiator::kMaxNotesPerStep))
+            return false;
+        phrase.steps[i].noteCount =
+            std::clamp<int32>(noteCount, 0, midiator::kMaxNotesPerStep);
+
+        for (int n = 0; n < midiator::kMaxNotesPerStep; ++n) {
+            int32 pitch = 0, velocity = 0, lengthSteps = 1;
+            if (!readValue(state, pitch) || !readValue(state, velocity) ||
+                !readValue(state, lengthSteps))
+                return false;
+            if (strict && (pitch < 0 || pitch > 127 ||
+                           velocity < 0 || velocity > 126 ||
+                           lengthSteps < 1 || lengthSteps > 16))
+                return false;
+            phrase.steps[i].notes[n].pitch = std::clamp<int32>(pitch, 0, 127);
+            phrase.steps[i].notes[n].velocity = std::clamp<int32>(velocity, 0, 126);
+            phrase.steps[i].notes[n].lengthSteps = std::clamp<int32>(lengthSteps, 1, 16);
+        }
+    }
+    return true;
+}
+
+bool writeDrumPhraseState(IBStream* state, const midiator::DrumPhrase& phrase) {
+    const int32 bars = phrase.bars;
+    if (!writeValue(state, bars))
+        return false;
+
+    for (int i = 0; i < midiator::kMaxSteps; ++i) {
+        const auto& step = phrase.steps[i];
+        const int32 hitCount = std::clamp(step.hitCount, 0, midiator::kMaxDrumHitsPerStep);
+        if (!writeValue(state, hitCount))
+            return false;
+        for (int n = 0; n < midiator::kMaxDrumHitsPerStep; ++n) {
+            const int32 voice = static_cast<int32>(step.hits[n].voice);
+            const int32 velocity = step.hits[n].velocity;
+            if (!writeValue(state, voice) || !writeValue(state, velocity))
+                return false;
+        }
+    }
+    return true;
+}
+
+bool readDrumPhraseState(IBStream* state, midiator::DrumPhrase& phrase, int fallbackBars,
+                         int serializedSteps, bool allow16Bars,
+                         bool strict = false) {
+    int32 bars = 0;
+    if (!readValue(state, bars))
+        return false;
+
+    const bool validLegacyBars = bars == 1 || bars == 2 || bars == 4 || bars == 8;
+    const bool validBars = validLegacyBars || (allow16Bars && bars == 16);
+    if (strict && !validBars)
+        return false;
+    if (serializedSteps < 1 || serializedSteps > midiator::kMaxSteps)
+        return false;
+
+    phrase.bars = validBars ? bars : fallbackBars;
+    for (auto& step : phrase.steps)
+        step = {};
+
+    for (int i = 0; i < serializedSteps; ++i) {
+        int32 hitCount = 0;
+        if (!readValue(state, hitCount))
+            return false;
+        if (strict && (hitCount < 0 || hitCount > midiator::kMaxDrumHitsPerStep))
+            return false;
+        phrase.steps[i].hitCount =
+            std::clamp<int32>(hitCount, 0, midiator::kMaxDrumHitsPerStep);
+        for (int n = 0; n < midiator::kMaxDrumHitsPerStep; ++n) {
+            int32 voice = 0, velocity = 100;
+            if (!readValue(state, voice) || !readValue(state, velocity))
+                return false;
+            const int32 maxVoice =
+                static_cast<int32>(midiator::DrumVoice::Count) - 1;
+            if (strict && (voice < 0 || voice > maxVoice ||
+                           velocity < 1 || velocity > 126))
+                return false;
+            phrase.steps[i].hits[n].voice = static_cast<midiator::DrumVoice>(
+                std::clamp<int32>(voice, 0, maxVoice));
+            phrase.steps[i].hits[n].velocity = std::clamp<int32>(velocity, 1, 126);
+        }
+    }
+    return true;
+}
+
+bool writePadPhraseState(IBStream* state, const midiator::PadPhrase& phrase) {
+    const int32 bars = phrase.bars;
+    if (!writeValue(state, bars))
+        return false;
+
+    for (int i = 0; i < midiator::kMaxSteps; ++i) {
+        const auto& step = phrase.steps[i];
+        const int32 noteCount = std::clamp(step.noteCount, 0, midiator::kMaxPadVoices);
+        if (!writeValue(state, noteCount))
+            return false;
+        for (int n = 0; n < midiator::kMaxPadVoices; ++n) {
+            const int32 pitch = step.notes[n].pitch;
+            const int32 velocity = step.notes[n].velocity;
+            const int32 lengthSteps = step.notes[n].lengthSteps;
+            if (!writeValue(state, pitch) || !writeValue(state, velocity) ||
+                !writeValue(state, lengthSteps))
+                return false;
+        }
+    }
+    return true;
+}
+
+bool readPadPhraseState(IBStream* state, midiator::PadPhrase& phrase, int fallbackBars,
+                        int serializedSteps, bool allow16Bars,
+                        bool strict = false) {
+    int32 bars = 0;
+    if (!readValue(state, bars))
+        return false;
+
+    const bool validLegacyBars = bars == 1 || bars == 2 || bars == 4 || bars == 8;
+    const bool validBars = validLegacyBars || (allow16Bars && bars == 16);
+    if (strict && !validBars)
+        return false;
+    if (serializedSteps < 1 || serializedSteps > midiator::kMaxSteps)
+        return false;
+
+    phrase.bars = validBars ? bars : fallbackBars;
+    for (auto& step : phrase.steps)
+        step = {};
+
+    for (int i = 0; i < serializedSteps; ++i) {
+        int32 noteCount = 0;
+        if (!readValue(state, noteCount))
+            return false;
+        if (strict && (noteCount < 0 || noteCount > midiator::kMaxPadVoices))
+            return false;
+        phrase.steps[i].noteCount =
+            std::clamp<int32>(noteCount, 0, midiator::kMaxPadVoices);
+        for (int n = 0; n < midiator::kMaxPadVoices; ++n) {
+            int32 pitch = 60, velocity = 76, lengthSteps = 1;
+            if (!readValue(state, pitch) || !readValue(state, velocity) ||
+                !readValue(state, lengthSteps))
+                return false;
+            if (strict && (pitch < 0 || pitch > 127 ||
+                           velocity < 0 || velocity > 126 ||
+                           lengthSteps < 1 || lengthSteps > serializedSteps))
+                return false;
+            phrase.steps[i].notes[n].pitch = std::clamp<int32>(pitch, 0, 127);
+            phrase.steps[i].notes[n].velocity = std::clamp<int32>(velocity, 0, 126);
+            phrase.steps[i].notes[n].lengthSteps =
+                std::clamp<int32>(lengthSteps, 1, serializedSteps);
+        }
+    }
+    return true;
+}
+
+bool readStateHeader(IBStream* state,
+                     uint32_t& stateVersion,
+                     midiator::GeneratorSettings& settings,
+                     float& variationAmount,
+                     uint32_t& seed,
+                     int& manualRootPitchClass,
+                     bool& midiRootSource,
+                     bool& powerChordsEnabled,
+                     midiator::DrumMapId& drumMapId,
+                     midiator::BassSettings& bassSettings,
+                     midiator::DrumSettings& drumSettings,
+                     midiator::PadSettings& padSettings,
+                     midiator::SynthSettings& synthSettings) {
+    uint32_t magic = 0;
+    uint32_t version = 0;
+    int32 root = 0;
+    int32 scale = 0;
+    int32 bars = 0;
+
+    if (!readValue(state, magic) || !readValue(state, version) ||
+        magic != kStateMagic || (version < 1u || version > kStateVersion) ||
+        !readValue(state, root) || !readValue(state, scale) || !readValue(state, bars) ||
+        !readValue(state, settings.density) || !readValue(state, settings.complexity) ||
+        !readValue(state, settings.repetition) || !readValue(state, settings.powerChordChance) ||
+        !readValue(state, settings.palmMuteChance) || !readValue(state, variationAmount) ||
+        !readValue(state, seed)) {
+        return false;
+    }
+
+    const bool strictCurrent = version >= 5u;
+    const bool validLegacyBars =
+        bars == 1 || bars == 2 || bars == 4 || bars == 8;
+    const bool validBars =
+        validLegacyBars || (version >= 8u && bars == 16);
+    const bool validScale =
+        scale >= 0 && scale < static_cast<int32>(midiator::ScaleId::Count);
+    const bool validUnitFloats =
+        std::isfinite(settings.density) && settings.density >= 0.0f && settings.density <= 1.0f &&
+        std::isfinite(settings.complexity) && settings.complexity >= 0.0f && settings.complexity <= 1.0f &&
+        std::isfinite(settings.repetition) && settings.repetition >= 0.0f && settings.repetition <= 1.0f &&
+        std::isfinite(settings.powerChordChance) && settings.powerChordChance >= 0.0f && settings.powerChordChance <= 1.0f &&
+        std::isfinite(settings.palmMuteChance) && settings.palmMuteChance >= 0.0f && settings.palmMuteChance <= 1.0f &&
+        std::isfinite(variationAmount) && variationAmount >= 0.0f && variationAmount <= 1.0f;
+
+    if (strictCurrent &&
+        (root < 0 || root > 11 || !validScale || !validBars || !validUnitFloats))
+        return false;
+
+    settings.rootPitchClass = std::clamp<int32>(root, 0, 11);
+
+    if (version >= 2u) {
+        int32 storedManualRoot = settings.rootPitchClass;
+        int32 storedRootSource = 1;
+        if (!readValue(state, storedManualRoot) || !readValue(state, storedRootSource))
+            return false;
+        if (strictCurrent &&
+            (storedManualRoot < 0 || storedManualRoot > 11 ||
+             (storedRootSource != 0 && storedRootSource != 1)))
+            return false;
+        manualRootPitchClass = std::clamp<int32>(storedManualRoot, 0, 11);
+        midiRootSource = storedRootSource != 0;
+
+        if (version >= 3u) {
+            int32 storedStyle = 0;
+            if (!readValue(state, storedStyle))
+                return false;
+            // V3-V10 only knew the original three style IDs. The unreleased
+            // V11 development line and V12 know the expanded enum. Historical
+            // states must not reinterpret formerly invalid values as new genres.
+            const int32 maxStyle =
+                version >= 11u
+                    ? static_cast<int32>(midiator::StyleId::Count) - 1
+                    : static_cast<int32>(midiator::StyleId::HeavyIndustrial);
+            if (strictCurrent && (storedStyle < 0 || storedStyle > maxStyle))
+                return false;
+            settings.style = static_cast<midiator::StyleId>(
+                std::clamp<int32>(storedStyle, 0, maxStyle));
+        } else {
+            settings.style = midiator::StyleId::NDHIndustrial;
+        }
+
+        if (version >= 4u) {
+            int32 storedPowerChordsEnabled = 1;
+            if (!readValue(state, storedPowerChordsEnabled))
+                return false;
+            if (strictCurrent &&
+                (storedPowerChordsEnabled != 0 && storedPowerChordsEnabled != 1))
+                return false;
+            powerChordsEnabled = storedPowerChordsEnabled != 0;
+            settings.powerChordsEnabled = powerChordsEnabled;
+        } else {
+            powerChordsEnabled = true;
+            settings.powerChordsEnabled = true;
+        }
+
+        if (version >= 6u) {
+            int32 storedDrumMap = static_cast<int32>(midiator::DrumMapId::GeneralMidi);
+            if (!readValue(state, storedDrumMap))
+                return false;
+            const bool verifiedMap =
+                storedDrumMap == static_cast<int32>(midiator::DrumMapId::GeneralMidi) ||
+                storedDrumMap == static_cast<int32>(midiator::DrumMapId::EZdrummer3) ||
+                storedDrumMap == static_cast<int32>(midiator::DrumMapId::PerfectDrums) ||
+                (version >= 15u &&
+                 storedDrumMap ==
+                     static_cast<int32>(midiator::DrumMapId::AddictiveDrums2));
+            if (!verifiedMap)
+                return false;
+            drumMapId = static_cast<midiator::DrumMapId>(storedDrumMap);
+        } else {
+            drumMapId = midiator::DrumMapId::GeneralMidi;
+        }
+
+        if (version >= 7u) {
+            if (!readValue(state, bassSettings.follow) ||
+                !readValue(state, bassSettings.movement) ||
+                !readValue(state, drumSettings.density) ||
+                !readValue(state, drumSettings.complexity) ||
+                !readValue(state, padSettings.spread) ||
+                !readValue(state, padSettings.tension) ||
+                !readValue(state, synthSettings.activity) ||
+                !readValue(state, synthSettings.movement))
+                return false;
+
+            const float values[] = {
+                bassSettings.follow, bassSettings.movement,
+                drumSettings.density, drumSettings.complexity,
+                padSettings.spread, padSettings.tension,
+                synthSettings.activity, synthSettings.movement
+            };
+            for (float value : values)
+                if (!std::isfinite(value) || value < 0.0f || value > 1.0f)
+                    return false;
+
+            if (version >= 9u) {
+                if (!readValue(state, drumSettings.fillIntensity) ||
+                    !std::isfinite(drumSettings.fillIntensity) ||
+                    drumSettings.fillIntensity < 0.0f ||
+                    drumSettings.fillIntensity > 1.0f)
+                    return false;
+            } else {
+                drumSettings.fillIntensity = 0.50f;
+            }
+
+            if (version >= 10u) {
+                int32 storedSection = 0;
+                if (!readValue(state, storedSection))
+                    return false;
+
+                // The abandoned development-only Song Mode also used V11 and
+                // packed AUTO into bit 0x100 of the Section word. V12 has no
+                // Song Mode. Accept that V11 header, discard the retired flag,
+                // and keep the selected manual Section. Extra cached song data
+                // follows the normal five-role payload and is intentionally
+                // ignored by the current state reader.
+                if (version == 11u) {
+                    constexpr int32 kRetiredSongModeFlag = 0x100;
+                    constexpr int32 kAllowedV11SectionBits =
+                        kRetiredSongModeFlag | 0xFF;
+                    if (storedSection < 0 ||
+                        (storedSection & ~kAllowedV11SectionBits) != 0)
+                        return false;
+                    storedSection &= 0xFF;
+                }
+
+                const int32 maxSection =
+                    static_cast<int32>(midiator::SectionType::Count) - 1;
+                if (storedSection < 0 || storedSection > maxSection)
+                    return false;
+                settings.section = static_cast<midiator::SectionType>(storedSection);
+            } else {
+                settings.section = midiator::SectionType::Free;
+            }
+        } else {
+            bassSettings.follow = 0.72f;
+            bassSettings.movement = 0.34f;
+            drumSettings.density = 0.48f;
+            drumSettings.complexity = 0.30f;
+            drumSettings.fillIntensity = 0.50f;
+            padSettings.spread = 0.42f;
+            padSettings.tension = 0.18f;
+            synthSettings.activity = 0.46f;
+            synthSettings.movement = 0.42f;
+            settings.section = midiator::SectionType::Free;
+        }
+    } else {
+        // V1 had only one fixed root and therefore maps naturally to Manual.
+        manualRootPitchClass = settings.rootPitchClass;
+        midiRootSource = false;
+        settings.style = midiator::StyleId::NDHIndustrial;
+        powerChordsEnabled = true;
+        settings.powerChordsEnabled = true;
+        drumMapId = midiator::DrumMapId::GeneralMidi;
+        bassSettings.follow = 0.72f;
+        bassSettings.movement = 0.34f;
+        drumSettings.density = 0.48f;
+        drumSettings.complexity = 0.30f;
+        drumSettings.fillIntensity = 0.50f;
+        padSettings.spread = 0.42f;
+        padSettings.tension = 0.18f;
+        synthSettings.activity = 0.46f;
+        synthSettings.movement = 0.42f;
+        settings.section = midiator::SectionType::Free;
+    }
+
+    settings.scale = static_cast<midiator::ScaleId>(
+        std::clamp<int32>(scale, 0, static_cast<int32>(midiator::ScaleId::Count) - 1));
+    settings.bars = validBars ? bars : 2;
+    settings.density = std::clamp(settings.density, 0.0f, 1.0f);
+    settings.complexity = std::clamp(settings.complexity, 0.0f, 1.0f);
+    settings.repetition = std::clamp(settings.repetition, 0.0f, 1.0f);
+    settings.powerChordChance = std::clamp(settings.powerChordChance, 0.0f, 1.0f);
+    settings.palmMuteChance = std::clamp(settings.palmMuteChance, 0.0f, 1.0f);
+    variationAmount = std::clamp(variationAmount, 0.0f, 1.0f);
+    stateVersion = version;
+    return true;
+}
+
+bool readExtendedStateTail(IBStream* state,
+                           uint32_t version,
+                           int& threshold,
+                           bool& midiNoteTrigger,
+                           std::array<bool, kEventOutputBusCount>& roleLocks,
+                           float& humanizeAmount) {
+    // V12 and older encoded the historical fixed PM zone ending at velocity
+    // 40. Use an exclusive threshold of 41 to reproduce that behavior exactly.
+    threshold = version >= 13u ? 30 : 41;
+    midiNoteTrigger = false;
+    roleLocks.fill(false);
+    humanizeAmount = 0.0f;
+
+    if (version >= 13u) {
+        int32 storedThreshold = 30;
+        if (!readValue(state, storedThreshold) ||
+            storedThreshold < 3 || storedThreshold > 87)
+            return false;
+        threshold = storedThreshold;
+    }
+
+    if (version >= 14u) {
+        int32 storedTrigger = 0;
+        if (!readValue(state, storedTrigger) ||
+            (storedTrigger != 0 && storedTrigger != 1))
+            return false;
+        midiNoteTrigger = storedTrigger != 0;
+    }
+
+    if (version >= 15u) {
+        int32 lockMask = 0;
+        if (!readValue(state, lockMask) ||
+            lockMask < 0 || (lockMask & ~0x1F) != 0 ||
+            !readValue(state, humanizeAmount) ||
+            !std::isfinite(humanizeAmount) ||
+            humanizeAmount < 0.0f || humanizeAmount > 1.0f)
+            return false;
+        for (int bus = 0; bus < kEventOutputBusCount; ++bus)
+            roleLocks[static_cast<size_t>(bus)] =
+                (lockMask & (1 << bus)) != 0;
+    }
+    return true;
+}
+
+uint32_t nextSeed(uint32_t x) {
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    return x ? x : 0x125A2026u;
+}
+
+int generatorRootMidi(int pitchClass, int lowRootMidi) noexcept {
+    int note = std::clamp(lowRootMidi, 0, 120);
+    while (note < 120 && note % 12 != pitchClass) ++note;
+    return note;
+}
+
+// A bounded stack-only VST3 event view. Root control notes divide a process
+// block at their actual sample offsets; no copying vectors, heap allocations
+// or host-owned event-list mutations are needed.
+class MidiatorEventSlice final : public IEventList {
+public:
+    // Each segment builds a bounded flat index once. getEventCount/getEvent
+    // are now O(1) rather than repeatedly traversing the complete host list.
+    // 4096 MIDI events per segment exceeds all normal Piano Roll / keyboard
+    // use and preserves predictable realtime memory/time.
+    static constexpr int32 kMaxIndexedEvents = 4096;
+    MidiatorEventSlice(IEventList* target, int32 begin, int32 end, bool output)
+        : target_(target), begin_(begin), output_(output) {
+        if (!target_ || output_) return;
+        const int32 count = target_->getEventCount();
+        for (int32 i = 0; i < count; ++i) {
+            Event e{};
+            if (target_->getEvent(i, e) != kResultOk ||
+                e.sampleOffset < begin || e.sampleOffset >= end)
+                continue;
+            if (indexedCount_ >= kMaxIndexedEvents) {
+                overflow_ = true;
+                break;
+            }
+            indices_[static_cast<size_t>(indexedCount_++)] = i;
+        }
+    }
+    bool overflow() const noexcept { return overflow_; }
+    tresult PLUGIN_API queryInterface(const TUID iid, void** obj) SMTG_OVERRIDE {
+        if (!obj) return kInvalidArgument;
+        if (FUnknownPrivate::iidEqual(iid, IEventList::iid) ||
+            FUnknownPrivate::iidEqual(iid, FUnknown::iid)) {
+            *obj = static_cast<IEventList*>(this);
+            return kResultOk;
+        }
+        *obj = nullptr;
+        return kNoInterface;
+    }
+    uint32 PLUGIN_API addRef() SMTG_OVERRIDE { return 1; }
+    uint32 PLUGIN_API release() SMTG_OVERRIDE { return 1; }
+    int32 PLUGIN_API getEventCount() SMTG_OVERRIDE { return indexedCount_; }
+    tresult PLUGIN_API getEvent(int32 index, Event& event) SMTG_OVERRIDE {
+        if (!target_ || output_ || index < 0 || index >= indexedCount_)
+            return kInvalidArgument;
+        if (target_->getEvent(indices_[static_cast<size_t>(index)], event) != kResultOk)
+            return kResultFalse;
+        event.sampleOffset -= begin_;
+        return kResultOk;
+    }
+    tresult PLUGIN_API addEvent(Event& event) SMTG_OVERRIDE {
+        if (!target_ || !output_) return kInvalidArgument;
+        Event shifted = event;
+        shifted.sampleOffset += begin_;
+        return target_->addEvent(shifted);
+    }
+private:
+    IEventList* target_ = nullptr;
+    int32 begin_ = 0;
+    bool output_ = false;
+    bool overflow_ = false;
+    int32 indexedCount_ = 0;
+    std::array<int32, kMaxIndexedEvents> indices_{};
+};
+
+int normalizedIndex(ParamValue v, int count) {
+    if (count <= 1)
+        return 0;
+    return std::clamp(static_cast<int>(std::lround(std::clamp(v, 0.0, 1.0) * (count - 1))), 0, count - 1);
+}
+
+
+} // namespace
+
+MidiatorProcessor::MidiatorProcessor()
+    : scheduledBuffer_(
+          std::make_unique<std::array<ScheduledEvent, kMaxScheduledEvents>>()) {
+    setControllerClass(ControllerUID);
+
+    // The sequencer depends on musical timeline position, tempo and
+    // transport play/stop state for sample-accurate event scheduling.
+    processContextRequirements.needProjectTimeMusic()
+                              .needBarPositionMusic()
+                              .needTempo()
+                              .needTimeSignature()
+                              .needTransportState();
+
+    // generateNew() already regenerates Bass -> Drums -> Pad -> Synth.
+    generateNew();
+}
+
+tresult PLUGIN_API MidiatorProcessor::initialize(FUnknown* context) {
+    auto r = AudioEffect::initialize(context);
+    if (r != kResultOk)
+        return r;
+
+    addEventInput(STR16("MIDI In"), 16, kMain, BusInfo::kDefaultActive);
+
+    // Each musical role owns a real VST3 event output bus. This is deliberate:
+    // hosts can route every generated part to a separate instrument without
+    // relying on MIDI-channel multiplexing inside one shared output.
+    addEventOutput(STR16("Guitar Out"), 1, kMain, BusInfo::kDefaultActive);
+    addEventOutput(STR16("Bass Out"),   1, kAux,  BusInfo::kDefaultActive);
+    addEventOutput(STR16("Drums Out"),  1, kAux,  BusInfo::kDefaultActive);
+    addEventOutput(STR16("Pad Out"),    1, kAux,  BusInfo::kDefaultActive);
+    addEventOutput(STR16("Synth Out"),  1, kAux,  BusInfo::kDefaultActive);
+    return kResultOk;
+}
+
+tresult PLUGIN_API MidiatorProcessor::setActive(TBool state) {
+    if (!state) {
+        // No event list is available from setActive(false), so never discard
+        // active-note knowledge here. Force a defensive all-note flush on the
+        // next process call after reactivation.
+        lifecyclePanicPending_ = true;
+    } else if (!lifecyclePanicPending_) {
+        // Initial activation has no preceding notes to preserve.
+        for (auto& bus : activePitchesByBus_)
+            bus.fill(false);
+    }
+
+    wasPlaying_ = false;
+    haveExpectedProjectTime_ = false;
+    expectedProjectTimeQn_ = 0.0;
+    haveTransportAnchor_ = false;
+    transportAnchorQn_ = 0.0;
+    triggerHeldPitches_.fill(false);
+    triggerHeldCount_ = 0;
+    smoothRootShiftPending_ = false;
+    return AudioEffect::setActive(state);
+}
+
+tresult PLUGIN_API MidiatorProcessor::setProcessing(TBool state) {
+    // Hosts may call setProcessing(false) before they deliver a final stopped
+    // process block. There is no IEventList here, so clearing active pitches
+    // would make a later NoteOff recovery impossible. Preserve the state and
+    // request an all-note panic on the next process call instead.
+    if (!state) {
+        lifecyclePanicPending_ = true;
+    } else if (!lifecyclePanicPending_) {
+        for (auto& bus : activePitchesByBus_)
+            bus.fill(false);
+    }
+
+    wasPlaying_ = false;
+    haveExpectedProjectTime_ = false;
+    expectedProjectTimeQn_ = 0.0;
+    haveTransportAnchor_ = false;
+    transportAnchorQn_ = 0.0;
+    triggerHeldPitches_.fill(false);
+    triggerHeldCount_ = 0;
+    smoothRootShiftPending_ = false;
+    return kResultOk;
+}
+
+tresult PLUGIN_API MidiatorProcessor::canProcessSampleSize(int32 symbolicSampleSize) {
+    // Midiator processes only VST3 event data and never dereferences audio
+    // buffers, so both standard host sample formats are equally valid.
+    return (symbolicSampleSize == kSample32 || symbolicSampleSize == kSample64)
+        ? kResultTrue
+        : kResultFalse;
+}
+
+tresult PLUGIN_API MidiatorProcessor::getState(IBStream* state) {
+    if (!state)
+        return kInvalidArgument;
+
+    const int32 root = settings_.rootPitchClass;
+    const int32 scale = static_cast<int32>(settings_.scale);
+    const int32 bars = settings_.bars;
+
+    if (!writeValue(state, kStateMagic) || !writeValue(state, kStateVersion) ||
+        !writeValue(state, root) || !writeValue(state, scale) || !writeValue(state, bars) ||
+        !writeValue(state, settings_.density) || !writeValue(state, settings_.complexity) ||
+        !writeValue(state, settings_.repetition) || !writeValue(state, settings_.powerChordChance) ||
+        !writeValue(state, settings_.palmMuteChance) || !writeValue(state, variationAmount_) ||
+        !writeValue(state, seed_)) {
+        return kResultFalse;
+    }
+
+    const int32 manualRoot = manualRootPitchClass_;
+    const int32 rootSource = midiRootSource_ ? 1 : 0;
+    const int32 style = static_cast<int32>(settings_.style);
+    const int32 powerChordsEnabled = settings_.powerChordsEnabled ? 1 : 0;
+    const int32 drumMap = static_cast<int32>(drumMapId_);
+    if (!writeValue(state, manualRoot) || !writeValue(state, rootSource) ||
+        !writeValue(state, style) || !writeValue(state, powerChordsEnabled) ||
+        !writeValue(state, drumMap) ||
+        !writeValue(state, bassSettings_.follow) ||
+        !writeValue(state, bassSettings_.movement) ||
+        !writeValue(state, drumSettings_.density) ||
+        !writeValue(state, drumSettings_.complexity) ||
+        !writeValue(state, padSettings_.spread) ||
+        !writeValue(state, padSettings_.tension) ||
+        !writeValue(state, synthSettings_.activity) ||
+        !writeValue(state, synthSettings_.movement) ||
+        !writeValue(state, drumSettings_.fillIntensity) ||
+        !writeValue(state, static_cast<int32>(settings_.section)))
+        return kResultFalse;
+
+    if (!writePhraseState(state, phrase_) ||
+        !writePhraseState(state, bassPhrase_) ||
+        !writeDrumPhraseState(state, drumPhrase_) ||
+        !writePadPhraseState(state, padPhrase_) ||
+        !writePhraseState(state, synthPhrase_)) {
+        return kResultFalse;
+    }
+
+    const int32 palmMuteVelocityThreshold =
+        std::clamp(settings_.palmMuteVelocityThreshold, 3, 87);
+    if (!writeValue(state, palmMuteVelocityThreshold))
+        return kResultFalse;
+    const int32 triggerMode = midiNoteTrigger_ ? 1 : 0;
+    if (!writeValue(state, triggerMode))
+        return kResultFalse;
+
+    int32 lockMask = 0;
+    for (int bus = 0; bus < kEventOutputBusCount; ++bus)
+        if (roleLocks_[static_cast<size_t>(bus)])
+            lockMask |= (1 << bus);
+    const float humanize = std::clamp(humanizeAmount_, 0.0f, 1.0f);
+    if (!writeValue(state, lockMask) || !writeValue(state, humanize))
+        return kResultFalse;
+
+    // V17: all four immutable tonal references are essential for lossless
+    // root round-trips AFTER a project has been saved at an extreme octave.
+    // Keep V16's absolute guitar root as the FINAL 32-bit field so the
+    // canonical root metadata remains at the same end-of-state position.
+    if (!writeValue(state, static_cast<int32>(guitarReferenceRootMidi_)) ||
+        !writeValue(state, static_cast<int32>(bassReferenceRootClass_)) ||
+        !writeValue(state, static_cast<int32>(padReferenceRootClass_)) ||
+        !writeValue(state, static_cast<int32>(synthReferenceRootClass_)) ||
+        !writePhraseState(state, guitarRootReference_) ||
+        !writePhraseState(state, bassRootReference_) ||
+        !writePadPhraseState(state, padRootReference_) ||
+        !writePhraseState(state, synthRootReference_) ||
+        !writeValue(state, static_cast<int32>(guitarRootMidi_)))
+        return kResultFalse;
+
+    return kResultOk;
+}
+
+tresult PLUGIN_API MidiatorProcessor::setState(IBStream* state) {
+    if (!state)
+        return kInvalidArgument;
+
+    midiator::GeneratorSettings restored = settings_;
+    float restoredVariation = variationAmount_;
+    uint32_t restoredSeed = seed_;
+    int restoredManualRoot = manualRootPitchClass_;
+    bool restoredMidiRootSource = midiRootSource_;
+    bool restoredPowerChordsEnabled = settings_.powerChordsEnabled;
+    midiator::DrumMapId restoredDrumMapId = drumMapId_;
+    midiator::BassSettings restoredBassSettings = bassSettings_;
+    midiator::DrumSettings restoredDrumSettings = drumSettings_;
+    midiator::PadSettings restoredPadSettings = padSettings_;
+    midiator::SynthSettings restoredSynthSettings = synthSettings_;
+    bool restoredMidiNoteTrigger = false;
+    std::array<bool, kEventOutputBusCount> restoredRoleLocks{};
+    float restoredHumanize = 0.0f;
+
+    uint32_t restoredStateVersion = 0;
+    if (!readStateHeader(state, restoredStateVersion, restored, restoredVariation, restoredSeed,
+                         restoredManualRoot, restoredMidiRootSource,
+                         restoredPowerChordsEnabled, restoredDrumMapId,
+                         restoredBassSettings, restoredDrumSettings,
+                         restoredPadSettings, restoredSynthSettings))
+        return kResultFalse;
+
+    midiator::Phrase restoredPhrase{};
+    const bool strictV5 = restoredStateVersion >= 5u;
+    const int serializedSteps =
+        restoredStateVersion >= 8u ? midiator::kMaxSteps : kLegacyStateSteps;
+    const bool allow16Bars = restoredStateVersion >= 8u;
+    if (!readPhraseState(state, restoredPhrase, restored.bars,
+                         serializedSteps, allow16Bars, strictV5))
+        return kResultFalse;
+
+    midiator::Phrase restoredBassPhrase{};
+    midiator::DrumPhrase restoredDrumPhrase{};
+    midiator::PadPhrase restoredPadPhrase{};
+    midiator::Phrase restoredSynthPhrase{};
+
+    if (restoredStateVersion >= 5u) {
+        if (!readPhraseState(state, restoredBassPhrase, restored.bars,
+                             serializedSteps, allow16Bars, true) ||
+            !readDrumPhraseState(state, restoredDrumPhrase, restored.bars,
+                                serializedSteps, allow16Bars, true) ||
+            !readPadPhraseState(state, restoredPadPhrase, restored.bars,
+                               serializedSteps, allow16Bars, true) ||
+            !readPhraseState(state, restoredSynthPhrase, restored.bars,
+                             serializedSteps, allow16Bars, true)) {
+            return kResultFalse;
+        }
+    }
+
+    if (!readExtendedStateTail(
+            state, restoredStateVersion, restored.palmMuteVelocityThreshold,
+            restoredMidiNoteTrigger, restoredRoleLocks, restoredHumanize))
+        return kResultFalse;
+
+    // V17 keeps a stable reference for each tonal role; previous versions
+    // never stored those references and must migrate from exact saved phrases.
+    midiator::Phrase restoredGuitarReference = restoredPhrase;
+    midiator::Phrase restoredBassReference = restoredBassPhrase;
+    midiator::PadPhrase restoredPadReference = restoredPadPhrase;
+    midiator::Phrase restoredSynthReference = restoredSynthPhrase;
+    int restoredReferenceGuitarMidi = -1;
+    int restoredReferenceBassClass = restored.rootPitchClass;
+    int restoredReferencePadClass = restored.rootPitchClass;
+    int restoredReferenceSynthClass = restored.rootPitchClass;
+    if (restoredStateVersion >= 17u) {
+        int32 storedGuitarMidi = -1, storedBassClass = -1;
+        int32 storedPadClass = -1, storedSynthClass = -1;
+        if (!readValue(state, storedGuitarMidi) ||
+            !readValue(state, storedBassClass) ||
+            !readValue(state, storedPadClass) ||
+            !readValue(state, storedSynthClass) ||
+            storedGuitarMidi < 0 || storedGuitarMidi > 120 ||
+            storedBassClass < 0 || storedBassClass > 11 ||
+            storedPadClass < 0 || storedPadClass > 11 ||
+            storedSynthClass < 0 || storedSynthClass > 11 ||
+            !readPhraseState(state, restoredGuitarReference, restored.bars,
+                             midiator::kMaxSteps, true, true) ||
+            !readPhraseState(state, restoredBassReference, restored.bars,
+                             midiator::kMaxSteps, true, true) ||
+            !readPadPhraseState(state, restoredPadReference, restored.bars,
+                                midiator::kMaxSteps, true, true) ||
+            !readPhraseState(state, restoredSynthReference, restored.bars,
+                             midiator::kMaxSteps, true, true) ||
+            restoredGuitarReference.bars != restoredPhrase.bars ||
+            restoredBassReference.bars != restoredBassPhrase.bars ||
+            restoredPadReference.bars != restoredPadPhrase.bars ||
+            restoredSynthReference.bars != restoredSynthPhrase.bars)
+            return kResultFalse;
+        restoredReferenceGuitarMidi = storedGuitarMidi;
+        restoredReferenceBassClass = storedBassClass;
+        restoredReferencePadClass = storedPadClass;
+        restoredReferenceSynthClass = storedSynthClass;
+    }
+
+    // The V16 final absolute Guitar root is retained, also in V17.
+    // Older project files keep their exact saved phrases and acquire an
+    // inferred root anchor without rewriting notes.
+    int restoredRootMidi = generatorRootMidi(restored.rootPitchClass, 33);
+    if (restoredStateVersion >= 16u) {
+        int32 savedRoot = -1;
+        if (!readValue(state, savedRoot) || savedRoot < 0 ||
+            savedRoot > 120 || savedRoot % 12 != restored.rootPitchClass)
+            return kResultFalse;
+        restoredRootMidi = savedRoot;
+    } else if (restoredPhrase.steps[0].noteCount > 0) {
+        const int first = restoredPhrase.steps[0].notes[0].pitch;
+        int shortest = 128;
+        for (int pitch = 0; pitch <= 120; ++pitch)
+            if (pitch % 12 == restored.rootPitchClass &&
+                std::abs(pitch - first) < shortest) {
+                restoredRootMidi = pitch;
+                shortest = std::abs(pitch - first);
+            }
+    }
+    if (restoredStateVersion < 17u)
+        restoredReferenceGuitarMidi = restoredRootMidi;
+
+    settings_ = restored;
+    variationAmount_ = restoredVariation;
+    seed_ = restoredSeed ? restoredSeed : 0x125A2026u;
+    manualRootPitchClass_ = restoredManualRoot;
+    midiRootSource_ = restoredMidiRootSource;
+    guitarRootMidi_ = restoredRootMidi;
+    settings_.lowRootMidi = midiRootSource_ ? guitarRootMidi_ : 33;
+    settings_.powerChordsEnabled = restoredPowerChordsEnabled;
+    drumMapId_ = restoredDrumMapId;
+    drumMap_ = midiator::DrumMidiMap::preset(drumMapId_);
+    bassSettings_ = restoredBassSettings;
+    drumSettings_ = restoredDrumSettings;
+    padSettings_ = restoredPadSettings;
+    synthSettings_ = restoredSynthSettings;
+    midiNoteTrigger_ = restoredMidiNoteTrigger;
+    roleLocks_ = restoredRoleLocks;
+    humanizeAmount_ = restoredHumanize;
+    triggerHeldPitches_.fill(false);
+    triggerHeldCount_ = 0;
+    lastPublishedRootPitchClass_ = -1;
+    smoothRootShiftPending_ = false;
+    phrase_ = restoredPhrase;
+    guitarRootReference_ = restoredGuitarReference;
+    guitarReferenceRootMidi_ = restoredReferenceGuitarMidi;
+
+    if (restoredStateVersion >= 5u) {
+        bassPhrase_ = restoredBassPhrase;
+        drumPhrase_ = restoredDrumPhrase;
+        padPhrase_ = restoredPadPhrase;
+        synthPhrase_ = restoredSynthPhrase;
+    } else {
+        // V1-V4 stored only Guitar. Recreate companion roles once during
+        // migration; subsequent V7 saves freeze the exact generated result.
+        regenerateBass();
+    }
+
+    // V17 restores immutable references verbatim. V1-V16 infer them
+    // from their saved current phrases, preserving legacy project recall.
+    bassRootReference_ = restoredStateVersion >= 17u
+        ? restoredBassReference : bassPhrase_;
+    padRootReference_ = restoredStateVersion >= 17u
+        ? restoredPadReference : padPhrase_;
+    synthRootReference_ = restoredStateVersion >= 17u
+        ? restoredSynthReference : synthPhrase_;
+    bassReferenceRootClass_ = restoredReferenceBassClass;
+    padReferenceRootClass_ = restoredReferencePadClass;
+    synthReferenceRootClass_ = restoredReferenceSynthClass;
+
+    // If state is restored while processing, preserve knowledge of currently
+    // active notes so the next process call can emit proper NoteOff events.
+    phraseChangedNeedsFlush_ = true;
+    wasPlaying_ = false;
+    haveExpectedProjectTime_ = false;
+    expectedProjectTimeQn_ = 0.0;
+    haveTransportAnchor_ = false;
+    transportAnchorQn_ = 0.0;
+    return kResultOk;
+}
+
+void MidiatorProcessor::generateNew() {
+    const bool allLocked =
+        std::all_of(roleLocks_.begin(), roleLocks_.end(),
+                    [](bool locked) { return locked; });
+    if (allLocked)
+        return;
+
+    const bool guitarLocked =
+        roleLocks_[static_cast<size_t>(kGuitarOutBus)];
+    const auto previous = phrase_;
+
+    auto structuralDifference = [](const midiator::Phrase& a, const midiator::Phrase& b) {
+        const int used = std::min(a.usedSteps(), b.usedSteps());
+        int different = std::abs(a.usedSteps() - b.usedSteps());
+
+        for (int i = 0; i < used; ++i) {
+            const auto& x = a.steps[i];
+            const auto& y = b.steps[i];
+
+            if (x.noteCount != y.noteCount) {
+                ++different;
+                continue;
+            }
+            if (x.noteCount == 0)
+                continue;
+
+            if (x.notes[0].pitch != y.notes[0].pitch ||
+                x.notes[0].lengthSteps != y.notes[0].lengthSteps ||
+                (x.noteCount > 1) != (y.noteCount > 1)) {
+                ++different;
+            }
+        }
+        return different;
+    };
+
+    auto onsetJaccard = [](const midiator::Phrase& a, const midiator::Phrase& b) {
+        const int used = std::min(a.usedSteps(), b.usedSteps());
+        int intersection = 0;
+        int unionCount = 0;
+
+        for (int i = 0; i < used; ++i) {
+            const bool hitA = a.steps[i].noteCount > 0;
+            const bool hitB = b.steps[i].noteCount > 0;
+            if (hitA || hitB)
+                ++unionCount;
+            if (hitA && hitB)
+                ++intersection;
+        }
+
+        if (unionCount == 0)
+            return 1.0;
+        return static_cast<double>(intersection) / static_cast<double>(unionCount);
+    };
+
+    if (guitarLocked) {
+        // NEW still advances the composition seed so unlocked companion roles
+        // can produce a genuinely new answer while Guitar stays bit-identical.
+        seed_ = nextSeed(seed_);
+    } else {
+    midiator::Phrase candidate{};
+    const bool havePrevious = previous.usedSteps() > 0;
+    const auto acceptance =
+        midiator::newRiffAcceptance(settings_.style, previous.usedSteps());
+    const int requiredDifference =
+        havePrevious ? acceptance.minStructuralDifference : 0;
+
+    // NEW RIFF must sound like a genuinely new groove, not merely a pitch
+    // variation. Keep the structurally valid candidate with the lowest onset
+    // overlap and accept immediately once both distance requirements are met.
+    midiator::Phrase bestCandidate{};
+    double bestOnsetJaccard = 2.0;
+    int bestStructuralDifference = -1;
+    uint32_t bestSeed = seed_;
+
+    for (int attempt = 0; attempt < 32; ++attempt) {
+        seed_ = nextSeed(seed_);
+        const auto effectiveSettings = sectionGeneratorSettings(settings_);
+        candidate = midiator::RiffEngine::generate(effectiveSettings, seed_);
+        midiator::applySectionPhraseShape(candidate, settings_.section, seed_);
+
+        if (!havePrevious) {
+            bestCandidate = candidate;
+            bestStructuralDifference = candidate.usedSteps();
+            bestOnsetJaccard = 0.0;
+            bestSeed = seed_;
+            break;
+        }
+
+        const int difference = structuralDifference(previous, candidate);
+        const double jaccard = onsetJaccard(previous, candidate);
+
+        if (jaccard < bestOnsetJaccard ||
+            (std::abs(jaccard - bestOnsetJaccard) < 1e-9 &&
+             difference > bestStructuralDifference)) {
+            bestCandidate = candidate;
+            bestOnsetJaccard = jaccard;
+            bestStructuralDifference = difference;
+            bestSeed = seed_;
+        }
+
+        if (difference >= requiredDifference &&
+            jaccard <= acceptance.maxOnsetJaccard)
+            break;
+    }
+
+    seed_ = bestSeed;
+    phrase_ = bestCandidate;
+    guitarRootMidi_ = generatorRootMidi(settings_.rootPitchClass,
+                                        settings_.lowRootMidi);
+    }
+
+    snapshotGuitarRootReference();
+    regenerateUnlockedCompanions();
+    phraseChangedNeedsFlush_ = true;
+
+    // Replacing the musical content must never move the sequencer phase.
+    // Keep the existing transport anchor so NEW RIFF, style changes and other
+    // regenerations remain locked to the host's running 16th-note grid.
+}
+void MidiatorProcessor::generateVariation() {
+    const bool allLocked =
+        std::all_of(roleLocks_.begin(), roleLocks_.end(),
+                    [](bool locked) { return locked; });
+    if (allLocked)
+        return;
+
+    seed_ = nextSeed(seed_);
+    if (!roleLocks_[static_cast<size_t>(kGuitarOutBus)]) {
+        const auto effectiveSettings = sectionGeneratorSettings(settings_);
+        phrase_ = midiator::RiffEngine::vary(
+            phrase_, effectiveSettings, variationAmount_, seed_);
+        midiator::applySectionPhraseShape(phrase_, settings_.section, seed_);
+    }
+    snapshotGuitarRootReference();
+    regenerateUnlockedCompanions();
+    phraseChangedNeedsFlush_ = true;
+}
+
+void MidiatorProcessor::regenerateBassOnly() {
+    bassSettings_.rootPitchClass = settings_.rootPitchClass;
+    bassSettings_.scale = settings_.scale;
+    bassSettings_.style = settings_.style;
+    const auto effectiveBass =
+        sectionBassSettings(bassSettings_, settings_.section);
+    bassPhrase_ = midiator::BassBrain::generate(
+        phrase_, effectiveBass, seed_ ^ 0xB4552026u);
+    bassRootReference_ = bassPhrase_;
+    bassReferenceRootClass_ = settings_.rootPitchClass;
+}
+
+void MidiatorProcessor::regenerateDrumsOnly() {
+    drumSettings_.style = settings_.style;
+    const auto effectiveDrums =
+        sectionDrumSettings(drumSettings_, settings_.section);
+    drumPhrase_ = midiator::DrumBrain::generate(
+        phrase_, bassPhrase_, effectiveDrums, seed_ ^ 0xD12A2026u);
+}
+
+void MidiatorProcessor::regeneratePadsOnly() {
+    padSettings_.rootPitchClass = settings_.rootPitchClass;
+    padSettings_.scale = settings_.scale;
+    padSettings_.style = settings_.style;
+    const auto effectivePads =
+        sectionPadSettings(padSettings_, settings_.section);
+    padPhrase_ = midiator::PadBrain::generate(
+        phrase_, bassPhrase_, effectivePads, seed_ ^ 0x50414426u);
+    padRootReference_ = padPhrase_;
+    padReferenceRootClass_ = settings_.rootPitchClass;
+}
+
+void MidiatorProcessor::regenerateSynthOnly() {
+    synthSettings_.rootPitchClass = settings_.rootPitchClass;
+    synthSettings_.scale = settings_.scale;
+    synthSettings_.style = settings_.style;
+    const auto effectiveSynth =
+        sectionSynthSettings(synthSettings_, settings_.section);
+    synthPhrase_ = midiator::SynthBrain::generate(
+        phrase_, bassPhrase_, padPhrase_, effectiveSynth, seed_ ^ 0x53594E26u);
+    synthRootReference_ = synthPhrase_;
+    synthReferenceRootClass_ = settings_.rootPitchClass;
+}
+
+void MidiatorProcessor::regenerateBass() {
+    regenerateBassOnly();
+    regenerateDrums();
+}
+
+void MidiatorProcessor::regenerateDrums() {
+    regenerateDrumsOnly();
+    regeneratePads();
+}
+
+void MidiatorProcessor::regeneratePads() {
+    regeneratePadsOnly();
+    regenerateSynth();
+}
+
+void MidiatorProcessor::regenerateSynth() {
+    regenerateSynthOnly();
+}
+
+void MidiatorProcessor::regenerateUnlockedCompanions() {
+    if (!roleLocks_[static_cast<size_t>(kBassOutBus)])
+        regenerateBassOnly();
+    if (!roleLocks_[static_cast<size_t>(kDrumsOutBus)])
+        regenerateDrumsOnly();
+    if (!roleLocks_[static_cast<size_t>(kPadOutBus)])
+        regeneratePadsOnly();
+    if (!roleLocks_[static_cast<size_t>(kSynthOutBus)])
+        regenerateSynthOnly();
+}
+
+void MidiatorProcessor::regenerateSectionFromCurrentSeed() {
+    // A section change is an arrangement decision, not a new-composition
+    // command. Reuse the current seed so Verse/Chorus/etc. remain recognizably
+    // related and switching back to FREE restores the same core riff.
+    const auto effectiveSettings = sectionGeneratorSettings(settings_);
+    phrase_ = midiator::RiffEngine::generate(effectiveSettings, seed_);
+    midiator::applySectionPhraseShape(phrase_, settings_.section, seed_);
+    guitarRootMidi_ = generatorRootMidi(settings_.rootPitchClass,
+                                        settings_.lowRootMidi);
+    snapshotGuitarRootReference();
+    regenerateBass();
+    phraseChangedNeedsFlush_ = true;
+}
+
+void MidiatorProcessor::resizePhraseBars(int newBars, bool regenerateCompanions) {
+    if (newBars != 1 && newBars != 2 && newBars != 4 &&
+        newBars != 8 && newBars != 16)
+        return;
+
+    const int oldBars = std::clamp(phrase_.bars, 1, midiator::kMaxBars);
+    if (newBars == oldBars) {
+        settings_.bars = newBars;
+        return;
+    }
+
+    midiator::Phrase resized{};
+    resized.bars = newBars;
+
+    const int oldSteps = oldBars * midiator::kStepsPerBar;
+    const int newSteps = newBars * midiator::kStepsPerBar;
+
+    // Changing phrase length is not a composition command. Preserve the exact
+    // existing riff and tile it when extending; truncate it when shortening.
+    // NEW RIFF remains the only control that deliberately replaces the idea.
+    for (int i = 0; i < newSteps; ++i)
+        resized.steps[i] = phrase_.steps[i % oldSteps];
+
+    phrase_ = resized;
+    settings_.bars = newBars;
+    snapshotGuitarRootReference();
+    if (regenerateCompanions)
+        regenerateBass();
+    phraseChangedNeedsFlush_ = true;
+}
+
+void MidiatorProcessor::applyPowerChordMode(bool enabled, bool regenerateCompanions) {
+    settings_.powerChordsEnabled = enabled;
+
+    if (!enabled) {
+        for (int i = 0; i < phrase_.usedSteps(); ++i)
+            if (phrase_.steps[i].noteCount > 1)
+                phrase_.steps[i].noteCount = 1;
+        snapshotGuitarRootReference();
+        if (regenerateCompanions)
+            regenerateBass();
+        phraseChangedNeedsFlush_ = true;
+        return;
+    }
+
+    int eligibleHits = 0;
+    int existingChords = 0;
+    for (int i = 0; i < phrase_.usedSteps(); ++i) {
+        const auto& step = phrase_.steps[i];
+        if (step.noteCount <= 0 || step.notes[0].pitch > 120)
+            continue;
+        ++eligibleHits;
+        if (step.noteCount > 1)
+            ++existingChords;
+    }
+
+    float styleFactor = 1.0f;
+    switch (settings_.style) {
+        case midiator::StyleId::DarkRockGothic: styleFactor=1.10f; break;
+        case midiator::StyleId::HeavyIndustrial: styleFactor=0.92f; break;
+        case midiator::StyleId::ClassicHeavy: styleFactor=1.20f; break;
+        case midiator::StyleId::Thrash: styleFactor=0.86f; break;
+        case midiator::StyleId::Groove: styleFactor=1.05f; break;
+        case midiator::StyleId::Death: styleFactor=0.78f; break;
+        case midiator::StyleId::MelodicDeath: styleFactor=1.08f; break;
+        case midiator::StyleId::Metalcore: styleFactor=1.12f; break;
+        case midiator::StyleId::NuMetal: styleFactor=1.18f; break;
+        case midiator::StyleId::Doom: styleFactor=1.28f; break;
+        case midiator::StyleId::DjentProgressive: styleFactor=0.82f; break;
+        default: break;
+    }
+
+    int targetChords = static_cast<int>(std::lround(
+        static_cast<float>(eligibleHits) * settings_.powerChordChance * styleFactor));
+    targetChords = std::clamp(targetChords, 0, eligibleHits);
+    if (settings_.powerChordChance >= 0.10f && eligibleHits > 0)
+        targetChords = std::max(1, targetChords);
+
+    static constexpr int preferredPositions[] = {
+        0, 8, 4, 12, 6, 14, 2, 10, 3, 11, 7, 15, 5, 13, 1, 9
+    };
+
+    for (int bar = 0; bar < phrase_.bars && existingChords < targetChords; ++bar) {
+        for (int local : preferredPositions) {
+            if (existingChords >= targetChords)
+                break;
+            auto& step = phrase_.steps[bar * midiator::kStepsPerBar + local];
+            if (step.noteCount != 1 || step.notes[0].pitch > 120)
+                continue;
+
+            step.noteCount = 2;
+            step.notes[1] = step.notes[0];
+            step.notes[1].pitch = step.notes[0].pitch + 7;
+            const int threshold =
+                std::clamp(settings_.palmMuteVelocityThreshold, 3, 87);
+            const int pmMin =
+                threshold == 41 ? 30 : std::max(2, threshold - 8);
+            step.notes[1].velocity = std::max(
+                step.notes[0].velocity >= 88 ? 88 : pmMin,
+                step.notes[0].velocity - 3);
+            ++existingChords;
+        }
+    }
+
+    snapshotGuitarRootReference();
+    if (regenerateCompanions)
+        regenerateBass();
+    phraseChangedNeedsFlush_ = true;
+}
+
+void MidiatorProcessor::applyPalmMuteVelocityThreshold(int threshold) {
+    const int oldThreshold = std::clamp(settings_.palmMuteVelocityThreshold, 3, 87);
+    const int newThreshold = std::clamp(threshold, 3, 87);
+    if (oldThreshold == newThreshold)
+        return;
+
+    const int oldMax = std::max(2, oldThreshold - 1);
+    const int newMax = std::max(2, newThreshold - 1);
+    for (int i = 0; i < phrase_.usedSteps(); ++i) {
+        auto& step = phrase_.steps[i];
+        for (int n = 0; n < step.noteCount; ++n) {
+            auto& note = step.notes[n];
+            if (note.velocity >= 88)
+                continue;
+            const double ratio = static_cast<double>(note.velocity) /
+                                 static_cast<double>(oldMax);
+            note.velocity = std::clamp(
+                static_cast<int>(std::lround(ratio * newMax)), 2, newMax);
+        }
+    }
+    settings_.palmMuteVelocityThreshold = newThreshold;
+    snapshotGuitarRootReference();
+    phraseChangedNeedsFlush_ = true;
+}
+
+void MidiatorProcessor::snapshotGuitarRootReference() noexcept {
+    guitarRootReference_ = phrase_;
+    guitarReferenceRootMidi_ = guitarRootMidi_;
+}
+
+void MidiatorProcessor::transposePhraseToRoot(int newRootPitchClass,
+                                             int newRootMidi,
+                                             bool regenerateCompanions) {
+    newRootPitchClass = std::clamp(newRootPitchClass, 0, 11);
+    if (newRootMidi < 0 || newRootMidi > 120 ||
+        newRootMidi % 12 != newRootPitchClass)
+        return;
+    const int delta = newRootMidi - guitarRootMidi_;
+    if (delta == 0 && newRootPitchClass == settings_.rootPitchClass)
+        return;
+    // Derive from the frozen musical reference, not the previously clipped
+    // MIDI output. Even an extreme A1 -> C8 -> A1 round-trip must reproduce
+    // every Guitar pitch and power chord, without touching rhythm/velocity.
+    const int referenceDelta = newRootMidi - guitarReferenceRootMidi_;
+    phrase_ = guitarRootReference_;
+    for (int stepIndex = 0; stepIndex < phrase_.usedSteps(); ++stepIndex) {
+        auto& step = phrase_.steps[stepIndex];
+        for (int n = 0; n < step.noteCount; ++n)
+            step.notes[n].pitch = std::clamp(
+                guitarRootReference_.steps[stepIndex].notes[n].pitch +
+                    referenceDelta, 0, 127);
+    }
+    settings_.rootPitchClass = newRootPitchClass;
+    guitarRootMidi_ = newRootMidi;
+    if (regenerateCompanions)
+        regenerateBass();
+    phraseChangedNeedsFlush_ = true;
+}
+
+void MidiatorProcessor::transposeCompanionPhrases(int /*semitones*/) noexcept {
+    // Avoid cumulative octave drift even when switching through extreme keys.
+    // The saved role content is the reference until that role regenerates.
+    midiator::retunePhraseFromReference(
+        bassPhrase_, bassRootReference_,
+        settings_.rootPitchClass, bassReferenceRootClass_, 24, 60);
+    midiator::retunePhraseFromReference(
+        padPhrase_, padRootReference_,
+        settings_.rootPitchClass, padReferenceRootClass_, 45, 88);
+    midiator::retunePhraseFromReference(
+        synthPhrase_, synthRootReference_,
+        settings_.rootPitchClass, synthReferenceRootClass_, 48, 96);
+    bassSettings_.rootPitchClass = settings_.rootPitchClass;
+    padSettings_.rootPitchClass = settings_.rootPitchClass;
+    synthSettings_.rootPitchClass = settings_.rootPitchClass;
+}
+
+bool MidiatorProcessor::migrateHeldTonalNotes(IEventList* output,
+                                               double ppqPosition) noexcept {
+    if (!output) return false;
+    struct Held { int bus, oldPitch, newPitch, velocity, step, voice; };
+    std::array<Held, kEventOutputBusCount * 128> held{};
+    int count = 0;
+    auto remap = [](int pitch, int delta, int low, int high) noexcept {
+        pitch += delta;
+        while (pitch < low) pitch += 12;
+        while (pitch > high) pitch -= 12;
+        return std::clamp(pitch, low, high);
+    };
+    for (int bus : {kGuitarOutBus, kBassOutBus, kPadOutBus, kSynthOutBus}) {
+        const int delta = bus == kGuitarOutBus
+                            ? smoothGuitarSemitones_ : smoothCompanionSemitones_;
+        const int low = bus == kGuitarOutBus ? 0 :
+                        bus == kBassOutBus ? 24 : bus == kPadOutBus ? 45 : 48;
+        const int high = bus == kGuitarOutBus ? 127 :
+                         bus == kBassOutBus ? 60 : bus == kPadOutBus ? 88 : 96;
+        for (int pitch = 0; pitch < 128; ++pitch) {
+            if (!activePitchesByBus_[static_cast<size_t>(bus)][static_cast<size_t>(pitch)])
+                continue;
+            const int step = activeStepByBus_[static_cast<size_t>(bus)][static_cast<size_t>(pitch)];
+            const int voice = activeVoiceByBus_[static_cast<size_t>(bus)][static_cast<size_t>(pitch)];
+            int newPitch = bus == kGuitarOutBus
+                ? std::clamp(pitch + delta, 0, 127)
+                : remap(pitch, delta, low, high);
+            // Prefer the EXACT corresponding generated voice after retuning
+            // rather than generic pitch folding; this preserves Pad octaves.
+            if (step >= 0 && voice >= 0) {
+                if (bus == kGuitarOutBus && step < phrase_.usedSteps() &&
+                    voice < phrase_.steps[step].noteCount)
+                    newPitch = phrase_.steps[step].notes[voice].pitch;
+                else if (bus == kBassOutBus && step < bassPhrase_.usedSteps() &&
+                         voice < bassPhrase_.steps[step].noteCount)
+                    newPitch = bassPhrase_.steps[step].notes[voice].pitch;
+                else if (bus == kPadOutBus && step < padPhrase_.usedSteps() &&
+                         voice < padPhrase_.steps[step].noteCount)
+                    newPitch = padPhrase_.steps[step].notes[voice].pitch;
+                else if (bus == kSynthOutBus && step < synthPhrase_.usedSteps() &&
+                         voice < synthPhrase_.steps[step].noteCount)
+                    newPitch = synthPhrase_.steps[step].notes[voice].pitch;
+            }
+            // An octave-only guitar change must not retrigger the unchanged
+            // Pad/Bass/Synth held notes. This would create the reported stutter.
+            if (newPitch == pitch)
+                continue;
+            held[count++] = {bus, pitch, newPitch,
+                             std::max(1, activeVelocitiesByBus_[static_cast<size_t>(bus)]
+                                                               [static_cast<size_t>(pitch)]),
+                             step, voice};
+        }
+    }
+    // NoteOff first, then immediate NoteOn at the same exact MIDI sample:
+    // no lost sustain or gap waiting for the next sequencer onset. On an
+    // output-capacity failure, defer to the established active-note recovery.
+    for (int i = 0; i < count; ++i) {
+        const auto& h = held[i];
+        Event off{};
+        off.busIndex = h.bus;
+        off.sampleOffset = 0;
+        off.ppqPosition = ppqPosition;
+        off.type = Event::kNoteOffEvent;
+        off.noteOff.channel = 0;
+        off.noteOff.pitch = static_cast<int16>(h.oldPitch);
+        off.noteOff.noteId = -1;
+        if (output->addEvent(off) != kResultOk) return false;
+        activePitchesByBus_[static_cast<size_t>(h.bus)][static_cast<size_t>(h.oldPitch)] = false;
+        activeVelocitiesByBus_[static_cast<size_t>(h.bus)][static_cast<size_t>(h.oldPitch)] = 0;
+        activeStepByBus_[static_cast<size_t>(h.bus)][static_cast<size_t>(h.oldPitch)] = -1;
+        activeVoiceByBus_[static_cast<size_t>(h.bus)][static_cast<size_t>(h.oldPitch)] = -1;
+    }
+    for (int i = 0; i < count; ++i) {
+        const auto& h = held[i];
+        Event on{};
+        on.busIndex = h.bus;
+        on.sampleOffset = 0;
+        on.ppqPosition = ppqPosition;
+        on.type = Event::kNoteOnEvent;
+        on.noteOn.channel = 0;
+        on.noteOn.pitch = static_cast<int16>(h.newPitch);
+        on.noteOn.velocity = static_cast<float>(h.velocity) / 127.0f;
+        // VST3 NoteOn.length is optional. Actual release belongs to the
+        // subsequent scheduled NoteOff, not an invented 100 ms duration.
+        on.noteOn.length = 0;
+        on.noteOn.noteId = -1;
+        if (output->addEvent(on) != kResultOk) return false;
+        activePitchesByBus_[static_cast<size_t>(h.bus)][static_cast<size_t>(h.newPitch)] = true;
+        activeVelocitiesByBus_[static_cast<size_t>(h.bus)][static_cast<size_t>(h.newPitch)] = h.velocity;
+        activeStepByBus_[static_cast<size_t>(h.bus)][static_cast<size_t>(h.newPitch)] = h.step;
+        activeVoiceByBus_[static_cast<size_t>(h.bus)][static_cast<size_t>(h.newPitch)] = h.voice;
+    }
+    return true;
+}
+
+void MidiatorProcessor::applyParameterChanges(ProcessData& data,
+                                             bool guiNewRiff,
+                                             bool guiVariation) {
+
+    struct Pending {
+        bool hasRoot = false;
+        int root = 0;
+        bool hasScale = false;
+        midiator::ScaleId scale = midiator::ScaleId::Phrygian;
+        bool hasBars = false;
+        int bars = 2;
+        bool hasSectionLength = false;
+        int sectionBars = 2;
+        bool hasSectionType = false;
+        midiator::SectionType sectionType = midiator::SectionType::Free;
+        bool hasDensity = false;
+        float density = 0.0f;
+        bool hasComplexity = false;
+        float complexity = 0.0f;
+        bool hasRepetition = false;
+        float repetition = 0.0f;
+        bool hasPowerChordAmount = false;
+        float powerChordAmount = 0.0f;
+        bool hasPowerChordsEnabled = false;
+        bool powerChordsEnabled = true;
+        bool hasPalmMute = false;
+        float palmMute = 0.0f;
+        bool hasPalmMuteVelocity = false;
+        int palmMuteVelocity = 30;
+        bool hasTriggerMode = false;
+        bool midiNoteTrigger = false;
+        bool hasVariationAmount = false;
+        float variationAmount = 0.0f;
+        bool hasLegacyStyle = false;
+        midiator::StyleId legacyStyle = midiator::StyleId::NDHIndustrial;
+        bool hasMetalStyle = false;
+        midiator::StyleId metalStyle = midiator::StyleId::NDHIndustrial;
+        bool hasRootSource = false;
+        bool midiRootSource = true;
+        bool hasLegacyDrumMap = false;
+        midiator::DrumMapId legacyDrumMap = midiator::DrumMapId::GeneralMidi;
+        bool hasVerifiedDrumMap = false;
+        midiator::DrumMapId verifiedDrumMap = midiator::DrumMapId::GeneralMidi;
+        bool hasBassFollow = false;
+        float bassFollow = 0.0f;
+        bool hasBassMovement = false;
+        float bassMovement = 0.0f;
+        bool hasDrumDensity = false;
+        float drumDensity = 0.0f;
+        bool hasDrumComplexity = false;
+        float drumComplexity = 0.0f;
+        bool hasFillIntensity = false;
+        float fillIntensity = 0.0f;
+        bool hasPadSpread = false;
+        float padSpread = 0.0f;
+        bool hasPadTension = false;
+        float padTension = 0.0f;
+        bool hasSynthActivity = false;
+        float synthActivity = 0.0f;
+        bool hasSynthMovement = false;
+        float synthMovement = 0.0f;
+        std::array<bool, kEventOutputBusCount> hasRoleLock{};
+        std::array<bool, kEventOutputBusCount> roleLock{};
+        bool hasHumanize = false;
+        float humanize = 0.0f;
+        bool newRiff = false;
+        bool variation = false;
+    } pending;
+    pending.newRiff = guiNewRiff;
+    pending.variation = guiVariation;
+
+    // Phase 1: collect only the final point from every queue. VST3 does not
+    // guarantee a semantically meaningful queue order, so no musical state is
+    // mutated while queues are being enumerated.
+    if (data.inputParameterChanges) {
+    for (int32 i = 0; i < data.inputParameterChanges->getParameterCount(); ++i) {
+        auto* queue = data.inputParameterChanges->getParameterData(i);
+        if (!queue || queue->getPointCount() <= 0)
+            continue;
+
+        const auto id = queue->getParameterId();
+        if (id == kNewRiffId || id == kVariationId) {
+            if (id == kNewRiffId)
+                pending.newRiff = true;
+            else
+                pending.variation = true;
+            continue;
+        }
+
+        int32 sampleOffset = 0;
+        ParamValue v = 0.0;
+        if (queue->getPoint(queue->getPointCount() - 1, sampleOffset, v) != kResultOk)
+            continue;
+        v = std::clamp(v, 0.0, 1.0);
+
+        switch (id) {
+            case kRootId:
+                pending.hasRoot = true;
+                pending.root = normalizedIndex(v, 12);
+                break;
+            case kScaleId:
+                pending.hasScale = true;
+                pending.scale = static_cast<midiator::ScaleId>(
+                    normalizedIndex(v, static_cast<int>(midiator::ScaleId::Count)));
+                break;
+            case kBarsId: {
+                // Frozen legacy mapping. Do not extend: old automation at
+                // 0, 1/3, 2/3, 1 must remain 1/2/4/8 bars.
+                static constexpr int bars[] = {1, 2, 4, 8};
+                pending.hasBars = true;
+                pending.bars = bars[normalizedIndex(v, 4)];
+                break;
+            }
+            case kSectionLengthId: {
+                static constexpr int bars[] = {1, 2, 4, 8, 16};
+                pending.hasSectionLength = true;
+                pending.sectionBars = bars[normalizedIndex(v, 5)];
+                break;
+            }
+            case kSectionTypeId:
+                pending.hasSectionType = true;
+                pending.sectionType = static_cast<midiator::SectionType>(
+                    normalizedIndex(v, static_cast<int>(midiator::SectionType::Count)));
+                break;
+            case kDensityId:
+                pending.hasDensity = true;
+                pending.density = static_cast<float>(v);
+                break;
+            case kComplexityId:
+                pending.hasComplexity = true;
+                pending.complexity = static_cast<float>(v);
+                break;
+            case kRepetitionId:
+                pending.hasRepetition = true;
+                pending.repetition = static_cast<float>(v);
+                break;
+            case kPowerChordId:
+                pending.hasPowerChordAmount = true;
+                pending.powerChordAmount = static_cast<float>(v);
+                break;
+            case kPowerChordsEnabledId:
+                pending.hasPowerChordsEnabled = true;
+                pending.powerChordsEnabled = v > 0.5;
+                break;
+            case kPalmMuteId:
+                pending.hasPalmMute = true;
+                pending.palmMute = static_cast<float>(v);
+                break;
+            case kPalmMuteVelocityId:
+                pending.hasPalmMuteVelocity = true;
+                pending.palmMuteVelocity =
+                    3 + normalizedIndex(v, 85);
+                break;
+            case kTriggerModeId:
+                pending.hasTriggerMode = true;
+                pending.midiNoteTrigger = v > 0.5;
+                break;
+            case kVariationAmountId:
+                pending.hasVariationAmount = true;
+                pending.variationAmount = static_cast<float>(v);
+                break;
+            case kStyleId:
+                // Frozen legacy mapping: 0 / 0.5 / 1.0 -> old styles 0 / 1 / 2.
+                pending.hasLegacyStyle = true;
+                pending.legacyStyle = static_cast<midiator::StyleId>(
+                    normalizedIndex(v, 3));
+                break;
+            case kMetalStyleId:
+                pending.hasMetalStyle = true;
+                pending.metalStyle = static_cast<midiator::StyleId>(
+                    normalizedIndex(v, static_cast<int>(midiator::StyleId::Count)));
+                break;
+            case kRootSourceId:
+                pending.hasRootSource = true;
+                pending.midiRootSource = v > 0.5;
+                break;
+            case kDrumMapId: {
+                pending.hasLegacyDrumMap = true;
+                const int index = normalizedIndex(v, 3);
+                pending.legacyDrumMap = index == 0
+                    ? midiator::DrumMapId::GeneralMidi
+                    : (index == 1 ? midiator::DrumMapId::EZdrummer3
+                                  : midiator::DrumMapId::PerfectDrums);
+                break;
+            }
+            case kVerifiedDrumMapId: {
+                pending.hasVerifiedDrumMap = true;
+                const int index = normalizedIndex(v, 4);
+                static constexpr midiator::DrumMapId maps[] = {
+                    midiator::DrumMapId::GeneralMidi,
+                    midiator::DrumMapId::EZdrummer3,
+                    midiator::DrumMapId::PerfectDrums,
+                    midiator::DrumMapId::AddictiveDrums2
+                };
+                pending.verifiedDrumMap = maps[index];
+                break;
+            }
+            case kBassFollowId:
+                pending.hasBassFollow = true;
+                pending.bassFollow = static_cast<float>(v);
+                break;
+            case kBassMovementId:
+                pending.hasBassMovement = true;
+                pending.bassMovement = static_cast<float>(v);
+                break;
+            case kDrumDensityId:
+                pending.hasDrumDensity = true;
+                pending.drumDensity = static_cast<float>(v);
+                break;
+            case kDrumComplexityId:
+                pending.hasDrumComplexity = true;
+                pending.drumComplexity = static_cast<float>(v);
+                break;
+            case kFillIntensityId:
+                pending.hasFillIntensity = true;
+                pending.fillIntensity = static_cast<float>(v);
+                break;
+            case kPadSpreadId:
+                pending.hasPadSpread = true;
+                pending.padSpread = static_cast<float>(v);
+                break;
+            case kPadTensionId:
+                pending.hasPadTension = true;
+                pending.padTension = static_cast<float>(v);
+                break;
+            case kSynthActivityId:
+                pending.hasSynthActivity = true;
+                pending.synthActivity = static_cast<float>(v);
+                break;
+            case kSynthMovementId:
+                pending.hasSynthMovement = true;
+                pending.synthMovement = static_cast<float>(v);
+                break;
+            case kGuitarLockId:
+            case kBassLockId:
+            case kDrumsLockId:
+            case kPadLockId:
+            case kSynthLockId: {
+                const int role = static_cast<int>(id - kGuitarLockId);
+                pending.hasRoleLock[static_cast<size_t>(role)] = true;
+                pending.roleLock[static_cast<size_t>(role)] = v > 0.5;
+                break;
+            }
+            case kHumanizeId:
+                pending.hasHumanize = true;
+                pending.humanize = static_cast<float>(v);
+                break;
+            default:
+                break;
+        }
+    }
+
+    }
+ 
+    // Phase 2: establish the final block settings before any phrase operation.
+    // This makes Style + Power-Chord Amount + Toggle deterministic regardless
+    // of the host's queue ordering.
+    if (pending.hasDensity)
+        settings_.density = pending.density;
+    if (pending.hasComplexity)
+        settings_.complexity = pending.complexity;
+    if (pending.hasRepetition)
+        settings_.repetition = pending.repetition;
+    if (pending.hasPowerChordAmount)
+        settings_.powerChordChance = pending.powerChordAmount;
+    if (pending.hasPalmMute)
+        settings_.palmMuteChance = pending.palmMute;
+    if (pending.hasPalmMuteVelocity)
+        applyPalmMuteVelocityThreshold(pending.palmMuteVelocity);
+    if (pending.hasTriggerMode &&
+        pending.midiNoteTrigger != midiNoteTrigger_) {
+        midiNoteTrigger_ = pending.midiNoteTrigger;
+        phraseChangedNeedsFlush_ = true;
+    }
+    if (pending.hasVariationAmount)
+        variationAmount_ = pending.variationAmount;
+    for (int role = 0; role < kEventOutputBusCount; ++role)
+        if (pending.hasRoleLock[static_cast<size_t>(role)])
+            roleLocks_[static_cast<size_t>(role)] =
+                pending.roleLock[static_cast<size_t>(role)];
+    if (pending.hasHumanize)
+        humanizeAmount_ = std::clamp(pending.humanize, 0.0f, 1.0f);
+    bool hasRequestedDrumMap = false;
+    midiator::DrumMapId requestedDrumMap = drumMapId_;
+    if (pending.hasVerifiedDrumMap &&
+        (pending.verifiedDrumMap != midiator::DrumMapId::GeneralMidi ||
+         !pending.hasLegacyDrumMap ||
+         pending.legacyDrumMap == midiator::DrumMapId::GeneralMidi)) {
+        requestedDrumMap = pending.verifiedDrumMap;
+        hasRequestedDrumMap = true;
+    } else if (pending.hasLegacyDrumMap) {
+        requestedDrumMap = pending.legacyDrumMap;
+        hasRequestedDrumMap = true;
+    } else if (pending.hasVerifiedDrumMap) {
+        requestedDrumMap = pending.verifiedDrumMap;
+        hasRequestedDrumMap = true;
+    }
+    if (hasRequestedDrumMap && requestedDrumMap != drumMapId_) {
+        drumMapId_ = requestedDrumMap;
+        drumMap_ = midiator::DrumMidiMap::preset(drumMapId_);
+        phraseChangedNeedsFlush_ = true;
+    }
+
+    bool bassRoleChanged = false;
+    bool drumRoleChanged = false;
+    bool padRoleChanged = false;
+    bool synthRoleChanged = false;
+
+    if (pending.hasBassFollow && pending.bassFollow != bassSettings_.follow) {
+        bassSettings_.follow = pending.bassFollow;
+        bassRoleChanged = true;
+    }
+    if (pending.hasBassMovement && pending.bassMovement != bassSettings_.movement) {
+        bassSettings_.movement = pending.bassMovement;
+        bassRoleChanged = true;
+    }
+    if (pending.hasDrumDensity && pending.drumDensity != drumSettings_.density) {
+        drumSettings_.density = pending.drumDensity;
+        drumRoleChanged = true;
+    }
+    if (pending.hasDrumComplexity && pending.drumComplexity != drumSettings_.complexity) {
+        drumSettings_.complexity = pending.drumComplexity;
+        drumRoleChanged = true;
+    }
+    if (pending.hasFillIntensity && pending.fillIntensity != drumSettings_.fillIntensity) {
+        drumSettings_.fillIntensity = pending.fillIntensity;
+        drumRoleChanged = true;
+    }
+    if (pending.hasPadSpread && pending.padSpread != padSettings_.spread) {
+        padSettings_.spread = pending.padSpread;
+        padRoleChanged = true;
+    }
+    if (pending.hasPadTension && pending.padTension != padSettings_.tension) {
+        padSettings_.tension = pending.padTension;
+        padRoleChanged = true;
+    }
+    if (pending.hasSynthActivity && pending.synthActivity != synthSettings_.activity) {
+        synthSettings_.activity = pending.synthActivity;
+        synthRoleChanged = true;
+    }
+    if (pending.hasSynthMovement && pending.synthMovement != synthSettings_.movement) {
+        synthSettings_.movement = pending.synthMovement;
+        synthRoleChanged = true;
+    }
+
+    const auto oldScale = settings_.scale;
+    const auto oldStyle = settings_.style;
+    const auto oldSection = settings_.section;
+    if (pending.hasScale)
+        settings_.scale = pending.scale;
+    // Resolve old/new automation without allowing the newly-added default
+    // value to overwrite a meaningful historical automation value (or vice
+    // versa). A non-default new style wins over legacy default NDH; a
+    // meaningful legacy style wins over a new default NDH.
+    if (pending.hasMetalStyle &&
+        (pending.metalStyle != midiator::StyleId::NDHIndustrial ||
+         !pending.hasLegacyStyle ||
+         pending.legacyStyle == midiator::StyleId::NDHIndustrial)) {
+        settings_.style = pending.metalStyle;
+    } else if (pending.hasLegacyStyle) {
+        settings_.style = pending.legacyStyle;
+    } else if (pending.hasMetalStyle) {
+        settings_.style = pending.metalStyle;
+    }
+    if (pending.hasSectionType)
+        settings_.section = pending.sectionType;
+
+    if (pending.hasRoot)
+        manualRootPitchClass_ = pending.root;
+
+    const bool finalMidiRootSource =
+        pending.hasRootSource ? pending.midiRootSource : midiRootSource_;
+
+    // MIDI root is also a block-level command. Only the final NoteOn matters,
+    // and whether it matters at all is decided from the final Root Source
+    // parameter for this same block.
+    int finalMidiRootNote = -1;
+    int32 finalMidiSampleOffset = -1;
+    if (finalMidiRootSource && data.inputEvents) {
+        for (int32 i = 0; i < data.inputEvents->getEventCount(); ++i) {
+            Event event{};
+            if (data.inputEvents->getEvent(i, event) != kResultOk ||
+                event.type != Event::kNoteOnEvent ||
+                event.noteOn.velocity <= 0.0f)
+                continue;
+            // Keep the *absolute MIDI pitch*, including its octave.
+            const int pitch = static_cast<int>(event.noteOn.pitch);
+            if (pitch < 0 || pitch > 120)
+                continue;
+            if (event.sampleOffset >= finalMidiSampleOffset) {
+                finalMidiSampleOffset = event.sampleOffset;
+                finalMidiRootNote = pitch;
+            }
+        }
+    }
+
+    const bool tonalFrameChanged =
+        settings_.scale != oldScale || settings_.style != oldStyle;
+    const bool sectionChanged = settings_.section != oldSection;
+    const bool freshGeneration = tonalFrameChanged || pending.newRiff;
+
+    bool guitarEdited = false;
+    bool companionsRetuned = false;
+
+    const bool wasMidiRootSource = midiRootSource_;
+    midiRootSource_ = finalMidiRootSource;
+    int desiredRootClass = settings_.rootPitchClass;
+    int desiredGuitarRoot = guitarRootMidi_;
+    if (midiRootSource_) {
+        if (finalMidiRootNote >= 0) {
+            desiredRootClass = finalMidiRootNote % 12;
+            desiredGuitarRoot = finalMidiRootNote;
+        }
+        // Until a MIDI NoteOn arrives, retain the previously selected register.
+        settings_.lowRootMidi = desiredGuitarRoot;
+    } else {
+        desiredRootClass = manualRootPitchClass_;
+        if (wasMidiRootSource && pending.hasRootSource) {
+            // Returning to MANUAL restores the normal guitar register.
+            desiredGuitarRoot = generatorRootMidi(desiredRootClass, 33);
+        } else {
+            // Preserve legacy manual shortest-path pitch-class edits.
+            int delta = desiredRootClass - settings_.rootPitchClass;
+            if (delta > 6) delta -= 12;
+            else if (delta < -6) delta += 12;
+            desiredGuitarRoot += delta;
+            if (desiredGuitarRoot < 0 || desiredGuitarRoot > 120)
+                desiredGuitarRoot = generatorRootMidi(desiredRootClass, 33);
+        }
+        settings_.lowRootMidi = 33;
+    }
+    if (desiredRootClass != settings_.rootPitchClass ||
+        desiredGuitarRoot != guitarRootMidi_) {
+        if (freshGeneration || sectionChanged) {
+            settings_.rootPitchClass = desiredRootClass;
+            guitarRootMidi_ = desiredGuitarRoot;
+        } else {
+            // Root-only controls must never launch a five-engine regeneration
+            // in the realtime callback. Preserve existing role timing and
+            // perform a same-sample handoff of currently sustained notes.
+            // A pending cleanup after project restore or prior parameter
+            // edits must not force recomposition of saved companion material.
+            // Retune the exact saved phrases and retain that cleanup request.
+            const bool hadPendingFlush = phraseChangedNeedsFlush_;
+            const bool rootOnly =
+                !pending.variation && !pending.hasBars &&
+                !pending.hasSectionLength && !pending.hasPowerChordsEnabled &&
+                !pending.hasPalmMuteVelocity &&
+                !bassRoleChanged && !drumRoleChanged &&
+                !padRoleChanged && !synthRoleChanged;
+            const int oldRootClass = settings_.rootPitchClass;
+            const int oldGuitarRoot = guitarRootMidi_;
+            transposePhraseToRoot(desiredRootClass, desiredGuitarRoot, false);
+            guitarEdited = true;
+            if (rootOnly) {
+                int semitones = desiredRootClass - oldRootClass;
+                if (semitones > 6) semitones -= 12;
+                else if (semitones < -6) semitones += 12;
+                transposeCompanionPhrases(semitones);
+                companionsRetuned = true;
+                // If the host still owes us a lifecycle/restore NoteOff
+                // cleanup, do NOT erase it or force a mid-note migration.
+                phraseChangedNeedsFlush_ = hadPendingFlush;
+                smoothRootShiftPending_ = !hadPendingFlush;
+                smoothGuitarSemitones_ = desiredGuitarRoot - oldGuitarRoot;
+                smoothCompanionSemitones_ = semitones;
+            }
+        }
+    }
+
+    // New Section Length wins if both it and frozen legacy Bars arrive in one
+    // host block. Legacy Bars remains fully functional for existing projects.
+    const bool hasRequestedBars = pending.hasSectionLength || pending.hasBars;
+    const int requestedBars =
+        pending.hasSectionLength ? pending.sectionBars : pending.bars;
+
+    // Phrase length is a structural edit only when no fresh composition is
+    // already required. Otherwise the generator creates the requested length
+    // directly, avoiding an intermediate companion-role cascade.
+    if (hasRequestedBars && requestedBars != settings_.bars) {
+        if (freshGeneration || sectionChanged) {
+            settings_.bars = requestedBars;
+        } else {
+            resizePhraseBars(requestedBars, false);
+            guitarEdited = true;
+        }
+    }
+
+    // Apply the chord toggle after final Style/Amount/Bars/Root are known.
+    if (pending.hasPowerChordsEnabled &&
+        pending.powerChordsEnabled != settings_.powerChordsEnabled) {
+        if (freshGeneration || sectionChanged) {
+            settings_.powerChordsEnabled = pending.powerChordsEnabled;
+        } else {
+            applyPowerChordMode(pending.powerChordsEnabled, false);
+            guitarEdited = true;
+        }
+    }
+
+    if (freshGeneration) {
+        generateNew();
+    } else if (sectionChanged) {
+        regenerateSectionFromCurrentSeed();
+    } else if (guitarEdited && !pending.variation) {
+        // A pure root edit already transposed tonal companions without
+        // touching drums; other structural edits still regenerate once.
+        if (!companionsRetuned)
+            regenerateBass();
+    }
+
+    // Variation is always last so Style/Scale/New-Riff and structural edits
+    // have deterministic semantics independent of VST3 queue ordering.
+    if (pending.variation)
+        generateVariation();
+
+    const bool arrangementAlreadyRegenerated =
+        freshGeneration || sectionChanged || guitarEdited || pending.variation;
+
+    if (!arrangementAlreadyRegenerated) {
+        if (bassRoleChanged)
+            regenerateBass();
+        else if (drumRoleChanged)
+            regenerateDrums();
+        else if (padRoleChanged)
+            regeneratePads();
+        else if (synthRoleChanged)
+            regenerateSynth();
+
+        if (bassRoleChanged || drumRoleChanged || padRoleChanged || synthRoleChanged)
+            phraseChangedNeedsFlush_ = true;
+    }
+}
+
+bool MidiatorProcessor::flushActiveNotes(
+    IEventList* output, double ppqPosition, bool forceAllNotes,
+    int32 sampleOffset) {
+    if (!output)
+        return false;
+
+    // A host can reject MIDI events after reaching its per-block capacity.
+    // Continue the 640-note defensive panic at the *next unaccepted note*.
+    const int total = kEventOutputBusCount * 128;
+    bool allDelivered = true;
+    for (int index = forceAllNotes ? panicNoteOffCursor_ : 0; index < total; ++index) {
+        const int bus = index / 128;
+        const int pitch = index % 128;
+        if (!forceAllNotes &&
+            !activePitchesByBus_[static_cast<size_t>(bus)][static_cast<size_t>(pitch)])
+            continue;
+        Event e{};
+        e.busIndex = bus;
+        e.sampleOffset = std::max<int32>(0, sampleOffset);
+        e.ppqPosition = ppqPosition;
+        e.type = Event::kNoteOffEvent;
+        e.noteOff.channel = 0;
+        e.noteOff.pitch = static_cast<int16>(pitch);
+        e.noteOff.velocity = 0.0f;
+        e.noteOff.noteId = -1;
+        if (output->addEvent(e) == kResultOk) {
+            activePitchesByBus_[static_cast<size_t>(bus)][static_cast<size_t>(pitch)] = false;
+            activeVelocitiesByBus_[static_cast<size_t>(bus)][static_cast<size_t>(pitch)] = 0;
+            activeStepByBus_[static_cast<size_t>(bus)][static_cast<size_t>(pitch)] = -1;
+            activeVoiceByBus_[static_cast<size_t>(bus)][static_cast<size_t>(pitch)] = -1;
+            if (forceAllNotes) panicNoteOffCursor_ = index + 1;
+        } else {
+            allDelivered = false;
+            if (forceAllNotes) return false; // retry from rejected note
+        }
+    }
+    if (forceAllNotes && allDelivered) panicNoteOffCursor_ = 0;
+    return allDelivered;
+}
+
+tresult PLUGIN_API MidiatorProcessor::notify(IMessage* message) {
+    if (!message || !message->getMessageID())
+        return kInvalidArgument;
+
+    if (std::strcmp(message->getMessageID(), kMsgNewRiff) == 0) {
+        pendingNewRiffCommands_.fetch_add(1, std::memory_order_release);
+        return kResultOk;
+    }
+    if (std::strcmp(message->getMessageID(), kMsgVariation) == 0) {
+        pendingVariationCommands_.fetch_add(1, std::memory_order_release);
+        return kResultOk;
+    }
+
+    return AudioEffect::notify(message);
+}
+
+tresult PLUGIN_API MidiatorProcessor::process(ProcessData& data) {
+    // Split only when the effective Root Source is MIDI. The independent
+    // MIDI NOTE trigger already handles sample-timed on/off transitions:
+    // splitting its note burst as if every key were a root change would
+    // perform huge redundant scheduling work on the realtime thread.
+    bool effectiveMidiRoot = midiRootSource_;
+    if (data.inputParameterChanges) {
+        for (int32 q = 0; q < data.inputParameterChanges->getParameterCount(); ++q) {
+            auto* queue = data.inputParameterChanges->getParameterData(q);
+            if (!queue || queue->getParameterId() != kRootSourceId ||
+                queue->getPointCount() <= 0)
+                continue;
+            int32 sampleOffset = 0;
+            ParamValue v = 0.0;
+            if (queue->getPoint(queue->getPointCount() - 1,
+                                sampleOffset, v) == kResultOk)
+                effectiveMidiRoot = v > 0.5;
+        }
+    }
+    // Host-sample-accurate root edits for live and drawn Piano Roll notes.
+    if (effectiveMidiRoot && data.inputEvents && data.numSamples > 1) {
+        // Preserve up to a full 16-bar chromatic Piano Roll in one offline
+        // block; do not silently discard or coalesce timed key commands.
+        constexpr int kMaxTimedRootChanges = 1024;
+        std::array<int32, kMaxTimedRootChanges + 2> cuts{};
+        int cutCount = 1;
+        cuts[0] = 0;
+        for (int32 i = 0; i < data.inputEvents->getEventCount(); ++i) {
+            Event e{};
+            if (data.inputEvents->getEvent(i, e) != kResultOk ||
+                e.type != Event::kNoteOnEvent || e.noteOn.velocity <= 0.0f ||
+                e.noteOn.pitch < 0 || e.noteOn.pitch > 120 ||
+                e.sampleOffset <= 0 || e.sampleOffset >= data.numSamples)
+                continue;
+            if (cutCount >= kMaxTimedRootChanges + 1) {
+                lifecyclePanicPending_ = true;
+                return kResultFalse;
+            }
+            cuts[cutCount++] = e.sampleOffset;
+        }
+        if (cutCount > 1) {
+            std::sort(cuts.begin(), cuts.begin() + cutCount);
+            cutCount = static_cast<int>(std::unique(cuts.begin(),
+                cuts.begin() + cutCount) - cuts.begin());
+            cuts[cutCount++] = data.numSamples;
+            // Use a separate scheduler function rather than recursion, so
+            // the large fixed realtime event array occupies ONE stack frame.
+            tresult result = kResultOk;
+            const auto* original = data.processContext;
+            for (int i = 0; i < cutCount - 1; ++i) {
+                const int32 begin = cuts[i];
+                const int32 end = cuts[i + 1];
+                if (begin >= end) continue;
+                ProcessContext segmentContext{};
+                if (original) {
+                    segmentContext = *original;
+                    if ((original->state & ProcessContext::kProjectTimeMusicValid) &&
+                        (original->state & ProcessContext::kTempoValid) &&
+                        original->tempo > 0.0 && original->sampleRate > 0.0)
+                        segmentContext.projectTimeMusic +=
+                            static_cast<double>(begin) * original->tempo /
+                            (60.0 * original->sampleRate);
+                    segmentContext.projectTimeSamples += begin;
+                }
+                MidiatorEventSlice input(data.inputEvents, begin, end, false);
+                MidiatorEventSlice output(data.outputEvents, begin, end, true);
+                if (input.overflow()) {
+                    lifecyclePanicPending_ = true;
+                    return kResultFalse;
+                }
+                ProcessData segment = data;
+                segment.numSamples = end - begin;
+                segment.processContext = original ? &segmentContext : nullptr;
+                segment.inputEvents = &input;
+                segment.outputEvents = data.outputEvents ? &output : nullptr;
+                segment.inputParameterChanges = i == 0 ? data.inputParameterChanges : nullptr;
+                // Report the final effective root once to the host controller.
+                segment.outputParameterChanges =
+                    i == cutCount - 2 ? data.outputParameterChanges : nullptr;
+                result = processBlock(segment);
+                if (result != kResultOk) break;
+            }
+            return result;
+        }
+    }
+    return processBlock(data);
+}
+
+tresult MidiatorProcessor::processBlock(ProcessData& data) {
+    if (data.processContext && data.processContext->sampleRate > 0.0)
+        sampleRate_ = data.processContext->sampleRate;
+
+    // GUI IConnectionPoint messages, parameter queues and MIDI-root NoteOns all
+    // describe the final musical state for this audio block. Consume the GUI
+    // atomics first, then apply the complete block exactly once so mixed command
+    // paths cannot trigger duplicate five-role compositions.
+    const uint32_t newCount =
+        pendingNewRiffCommands_.exchange(0, std::memory_order_acq_rel);
+    const uint32_t variationCount =
+        pendingVariationCommands_.exchange(0, std::memory_order_acq_rel);
+
+    applyParameterChanges(data, newCount > 0, variationCount > 0);
+
+    // Host-owned VST3 output queue; no heap allocations or GUI messages on
+    // the real-time thread. Retry later when the host offers no output queue.
+    if (data.outputParameterChanges &&
+        lastPublishedRootPitchClass_ != settings_.rootPitchClass) {
+        int32 queueIndex = 0;
+        if (auto* queue = data.outputParameterChanges->addParameterData(
+                kLiveRootId, queueIndex)) {
+            int32 pointIndex = 0;
+            if (queue->addPoint(0, static_cast<double>(settings_.rootPitchClass) / 11.0,
+                                pointIndex) == kResultOk)
+                lastPublishedRootPitchClass_ = settings_.rootPitchClass;
+        }
+    }
+
+    struct TriggerInputEvent {
+        int32 sampleOffset = 0;
+        int pitch = 0;
+        bool noteOn = false;
+    };
+    struct TriggerTransition {
+        int32 sampleOffset = 0;
+        bool openAfter = false;
+    };
+
+    std::array<TriggerInputEvent, kMaxTriggerInputEvents> triggerInput{};
+    std::array<TriggerTransition, kMaxTriggerInputEvents> triggerTransitions{};
+    int triggerInputCount = 0;
+    int triggerTransitionCount = 0;
+    bool triggerInputOverflow = false;
+    if (!midiNoteTrigger_) {
+        // Root Source=MIDI may still receive notes in TRANSPORT mode, but those
+        // notes must never become latent trigger state if the user later
+        // switches to MIDI NOTE.
+        triggerHeldPitches_.fill(false);
+        triggerHeldCount_ = 0;
+    }
+    const bool triggerOpenAtBlockStart =
+        midiNoteTrigger_ && triggerHeldCount_ > 0;
+
+    if (midiNoteTrigger_ && data.inputEvents) {
+        for (int32 i = 0; i < data.inputEvents->getEventCount(); ++i) {
+            Event event{};
+            if (data.inputEvents->getEvent(i, event) != kResultOk)
+                continue;
+
+            bool relevant = false;
+            bool noteOn = false;
+            int pitch = -1;
+            if (event.type == Event::kNoteOnEvent) {
+                pitch = static_cast<int>(event.noteOn.pitch);
+                noteOn = event.noteOn.velocity > 0.0f;
+                relevant = true;
+            } else if (event.type == Event::kNoteOffEvent) {
+                pitch = static_cast<int>(event.noteOff.pitch);
+                noteOn = false;
+                relevant = true;
+            }
+            if (!relevant || pitch < 0 || pitch > 127)
+                continue;
+
+            if (triggerInputCount >= kMaxTriggerInputEvents) {
+                triggerInputOverflow = true;
+                continue;
+            }
+
+            triggerInput[triggerInputCount++] = {
+                std::clamp<int32>(
+                    event.sampleOffset, 0,
+                    std::max<int32>(0, data.numSamples - 1)),
+                pitch,
+                noteOn
+            };
+        }
+    }
+
+    std::sort(triggerInput.begin(), triggerInput.begin() + triggerInputCount,
+              [](const TriggerInputEvent& a, const TriggerInputEvent& b) {
+                  if (a.sampleOffset != b.sampleOffset)
+                      return a.sampleOffset < b.sampleOffset;
+                  if (a.noteOn != b.noteOn)
+                      return !a.noteOn; // NoteOff before NoteOn at one sample.
+                  return a.pitch < b.pitch;
+              });
+
+    for (int i = 0; i < triggerInputCount; ++i) {
+        const auto& input = triggerInput[i];
+        const bool wasOpen = triggerHeldCount_ > 0;
+
+        if (input.noteOn) {
+            if (!triggerHeldPitches_[static_cast<size_t>(input.pitch)]) {
+                triggerHeldPitches_[static_cast<size_t>(input.pitch)] = true;
+                ++triggerHeldCount_;
+            }
+        } else if (triggerHeldPitches_[static_cast<size_t>(input.pitch)]) {
+            triggerHeldPitches_[static_cast<size_t>(input.pitch)] = false;
+            triggerHeldCount_ = std::max(0, triggerHeldCount_ - 1);
+        }
+
+        const bool isOpen = triggerHeldCount_ > 0;
+        if (wasOpen != isOpen &&
+            triggerTransitionCount < kMaxTriggerInputEvents) {
+            triggerTransitions[triggerTransitionCount++] = {
+                input.sampleOffset, isOpen
+            };
+        }
+    }
+
+    if (triggerInputOverflow) {
+        triggerHeldPitches_.fill(false);
+        triggerHeldCount_ = 0;
+        if (midiNoteTrigger_) {
+            // No new notes on an invalid trigger burst. Release currently
+            // sounding notes; retry rejected NoteOffs in the next block.
+            const double ppq = data.processContext &&
+                    (data.processContext->state & ProcessContext::kProjectTimeMusicValid)
+                ? data.processContext->projectTimeMusic : 0.0;
+            if (!data.outputEvents ||
+                !flushActiveNotes(data.outputEvents, ppq))
+                phraseChangedNeedsFlush_ = true;
+            return kResultFalse;
+        }
+    }
+
+    if (!data.outputEvents) {
+        if (smoothRootShiftPending_) {
+            smoothRootShiftPending_ = false;
+            phraseChangedNeedsFlush_ = true;
+        }
+        return kResultOk;
+    }
+
+    const auto* context = data.processContext;
+    const bool hasTempo = context && (context->state & ProcessContext::kTempoValid) && context->tempo > 0.0;
+    const bool hasProjectTime = context && (context->state & ProcessContext::kProjectTimeMusicValid);
+    const bool hasTimeSignature =
+        context && (context->state & ProcessContext::kTimeSigValid);
+    const bool unsupportedTimeSignature =
+        hasTimeSignature &&
+        (context->timeSigNumerator != 4 || context->timeSigDenominator != 4);
+    const bool playing = context && (context->state & ProcessContext::kPlaying);
+    const double currentPpq = hasProjectTime ? context->projectTimeMusic : 0.0;
+
+    // A tonal key change is a zero-gap MIDI handoff; drums continue without
+    // even one NoteOff. Do it before normal scheduling at this sample offset.
+    if (smoothRootShiftPending_) {
+        smoothRootShiftPending_ = false;
+        if (phraseChangedNeedsFlush_ || lifecyclePanicPending_) {
+            // A separate structural/lifecycle change owns the cleanup.
+        } else if (!migrateHeldTonalNotes(data.outputEvents, currentPpq)) {
+            phraseChangedNeedsFlush_ = true;
+            return kResultFalse;
+        }
+    }
+
+    // Any previously interrupted 640-note panic MUST resume even after
+    // transport state was marked stopped by the host. The cursor belongs to
+    // the pending flush, not to wasPlaying_.
+    if (lifecyclePanicPending_ || panicNoteOffCursor_ > 0) {
+        if (!flushActiveNotes(data.outputEvents, currentPpq, true))
+            return kResultFalse;
+        lifecyclePanicPending_ = false;
+    }
+
+    if (phraseChangedNeedsFlush_) {
+        if (!flushActiveNotes(data.outputEvents, currentPpq))
+            return kResultFalse;
+        phraseChangedNeedsFlush_ = false;
+    }
+
+    // V1 is deliberately 4/4-only. If a host supplies a valid non-4/4
+    // signature, do not silently run a four-quarter pattern against a
+    // different bar grid. Flush held notes and stay silent until 4/4 returns.
+    if (unsupportedTimeSignature) {
+        bool flushed = true;
+        if (wasPlaying_)
+            flushed = flushActiveNotes(data.outputEvents, currentPpq, true);
+        if (!flushed)
+            phraseChangedNeedsFlush_ = true;
+
+        wasPlaying_ = false;
+        haveExpectedProjectTime_ = false;
+        haveTransportAnchor_ = false;
+        transportAnchorQn_ = 0.0;
+        return flushed ? kResultOk : kResultFalse;
+    }
+
+    if (!playing || !hasTempo || !hasProjectTime || data.numSamples <= 0) {
+        bool flushed = true;
+        if (wasPlaying_)
+            flushed = flushActiveNotes(data.outputEvents, currentPpq, true);
+        if (!flushed)
+            phraseChangedNeedsFlush_ = true;
+
+        wasPlaying_ = playing;
+        haveExpectedProjectTime_ = false;
+        haveTransportAnchor_ = false;
+        transportAnchorQn_ = 0.0;
+        if (!playing) {
+            triggerHeldPitches_.fill(false);
+            triggerHeldCount_ = 0;
+        }
+        return flushed ? kResultOk : kResultFalse;
+    }
+
+    const double tempo = context->tempo;
+    const double qnPerSample = tempo / (60.0 * sampleRate_);
+    if (qnPerSample <= 0.0)
+        return kResultOk;
+
+    const double blockStartQn = context->projectTimeMusic;
+    const double blockEndQn = blockStartQn + static_cast<double>(data.numSamples) * qnPerSample;
+
+    bool timelineJump = false;
+    if (wasPlaying_ && haveExpectedProjectTime_) {
+        const double tolerance = std::max(1e-6, qnPerSample * 4.0);
+        timelineJump = std::abs(blockStartQn - expectedProjectTimeQn_) > tolerance;
+        if (timelineJump &&
+            !flushActiveNotes(data.outputEvents, blockStartQn, true)) {
+            phraseChangedNeedsFlush_ = true;
+            return kResultFalse;
+        }
+    }
+
+    // Lock phrase phase to the host's musical bar grid, not to whichever
+    // audio buffer happens to be the first one we process. This preserves
+    // sequencer sync when playback starts mid-bar and after timeline jumps.
+    if (!wasPlaying_ || !haveTransportAnchor_ || timelineJump) {
+        const bool hasBarPosition =
+            context && (context->state & ProcessContext::kBarPositionValid);
+        transportAnchorQn_ = hasBarPosition ? context->barPositionMusic : blockStartQn;
+        haveTransportAnchor_ = true;
+    }
+
+    wasPlaying_ = true;
+    haveExpectedProjectTime_ = true;
+    expectedProjectTimeQn_ = blockEndQn;
+    const double patternLengthQn = static_cast<double>(phrase_.bars) * 4.0;
+
+    if (patternLengthQn <= 0.0)
+        return kResultOk;
+
+    auto& scheduled = *scheduledBuffer_;
+    int scheduledCount = 0;
+    bool schedulerOverflow = false;
+
+    auto addScheduled = [&](double eventQn, bool noteOn, int pitch, int velocity,
+                            int32 busIndex, double noteOffQn = -1.0,
+        int stepIndex = -1, int noteIndex = -1) {
+        constexpr double eps = 1e-9;
+        if (eventQn + eps < blockStartQn || eventQn >= blockEndQn - eps)
+            return;
+        if (scheduledCount >= kMaxScheduledEvents) {
+            schedulerOverflow = true;
+            return;
+        }
+
+        const double relSamples = (eventQn - blockStartQn) / qnPerSample;
+        ScheduledEvent e{};
+        e.sampleOffset = std::clamp<int32>(
+            static_cast<int32>(std::floor(relSamples + 1e-9)),
+            0,
+            std::max<int32>(0, data.numSamples - 1));
+        e.ppqPosition = eventQn;
+        e.noteOn = noteOn;
+        e.pitch = std::clamp(pitch, 0, 127);
+        e.velocity = std::clamp(velocity, 0, 126);
+        e.busIndex = std::clamp<int32>(busIndex, 0, kEventOutputBusCount - 1);
+        e.stepIndex = stepIndex;
+        e.noteIndex = noteIndex;
+
+        if (noteOn && noteOffQn > eventQn) {
+            const double lengthSamples =
+                std::max(1.0, std::round((noteOffQn - eventQn) / qnPerSample));
+            e.noteLengthSamples = static_cast<int32>(std::min(
+                lengthSamples,
+                static_cast<double>(std::numeric_limits<int32>::max())));
+        }
+
+        scheduled[scheduledCount++] = e;
+    };
+
+    const double localBlockStartQn = blockStartQn - transportAnchorQn_;
+    const double localBlockEndQn = blockEndQn - transportAnchorQn_;
+    const long long firstCycle =
+        static_cast<long long>(std::floor(localBlockStartQn / patternLengthQn)) - 1;
+    const long long lastCycle =
+        static_cast<long long>(std::floor(localBlockEndQn / patternLengthQn)) + 1;
+
+    auto humanizeHash = [](uint64_t x) noexcept {
+        x ^= x >> 33;
+        x *= 0xff51afd7ed558ccdULL;
+        x ^= x >> 33;
+        x *= 0xc4ceb9fe1a85ec53ULL;
+        x ^= x >> 33;
+        return static_cast<uint32_t>(x ^ (x >> 32));
+    };
+    auto signedUnit = [&](uint64_t key) noexcept {
+        const uint32_t h = humanizeHash(key);
+        return (static_cast<double>(h) / 4294967295.0) * 2.0 - 1.0;
+    };
+    auto timingHumanizeQn = [&](int32 busIndex, int stepIndex,
+                                long long cycle) noexcept {
+        if (humanizeAmount_ <= 0.0f || stepIndex == 0)
+            return 0.0;
+
+        double maxMs = 5.0;
+        switch (settings_.style) {
+            case midiator::StyleId::Thrash:
+            case midiator::StyleId::Death:
+            case midiator::StyleId::Metalcore:
+            case midiator::StyleId::DjentProgressive:
+                maxMs = 3.0; break;
+            case midiator::StyleId::DarkRockGothic:
+            case midiator::StyleId::Groove:
+            case midiator::StyleId::NuMetal:
+                maxMs = 7.0; break;
+            case midiator::StyleId::Doom:
+                maxMs = 9.0; break;
+            default:
+                maxMs = 5.0; break;
+        }
+
+        const uint64_t cycleBits = static_cast<uint64_t>(cycle);
+        const uint64_t sharedKey =
+            (cycleBits * 0x9E3779B97F4A7C15ULL) ^
+            (static_cast<uint64_t>(stepIndex + 1) * 0xD1B54A32D192ED03ULL) ^
+            static_cast<uint64_t>(seed_);
+        const uint64_t localKey =
+            sharedKey ^ (static_cast<uint64_t>(busIndex + 1) *
+                         0x94D049BB133111EBULL);
+        const double unit =
+            0.65 * signedUnit(sharedKey) + 0.35 * signedUnit(localKey);
+        const double ms =
+            unit * maxMs * static_cast<double>(humanizeAmount_);
+        return (ms * 0.001) * tempo / 60.0;
+    };
+    auto humanizedVelocity = [&](int32 busIndex, int stepIndex,
+                                 long long cycle, int velocity) noexcept {
+        if (humanizeAmount_ <= 0.0f)
+            return std::clamp(velocity, 1, 126);
+        const uint64_t key =
+            (static_cast<uint64_t>(cycle) * 0xA24BAED4963EE407ULL) ^
+            (static_cast<uint64_t>(stepIndex + 1) * 0x9FB21C651E98DF25ULL) ^
+            (static_cast<uint64_t>(busIndex + 1) * 0xC13FA9A902A6328FULL) ^
+            static_cast<uint64_t>(seed_ ^ 0x48554D4Eu);
+        const int delta = static_cast<int>(std::lround(
+            signedUnit(key) * 5.0 * static_cast<double>(humanizeAmount_)));
+        const int varied = velocity + delta;
+
+        if (busIndex == kGuitarOutBus) {
+            if (velocity < 88)
+                return std::clamp(
+                    varied, 2,
+                    std::max(2, settings_.palmMuteVelocityThreshold - 1));
+            return std::clamp(varied, 88, 126);
+        }
+        return std::clamp(varied, 1, 126);
+    };
+
+    auto schedulePhraseCycle = [&](const midiator::Phrase& phrase,
+                                   int32 busIndex,
+                                   double cycleStartQn,
+                                   long long cycle) {
+        const int usedSteps = phrase.usedSteps();
+        constexpr double kSustainGapQn = 1.0 / 16.0;
+
+        for (int stepIndex = 0; stepIndex < usedSteps; ++stepIndex) {
+            const auto& step = phrase.steps[stepIndex];
+            if (step.noteCount <= 0)
+                continue;
+
+            int stepsToNextHit = usedSteps;
+            for (int delta = 1; delta <= usedSteps; ++delta) {
+                const int nextIndex = (stepIndex + delta) % usedSteps;
+                if (phrase.steps[nextIndex].noteCount > 0) {
+                    stepsToNextHit = delta;
+                    break;
+                }
+            }
+
+            const int nextStepIndex =
+                (stepIndex + stepsToNextHit) % usedSteps;
+            const long long nextCycle =
+                cycle + ((stepIndex + stepsToNextHit) >= usedSteps ? 1 : 0);
+            const double onQn =
+                cycleStartQn + static_cast<double>(stepIndex) * kStepQuarterNotes +
+                timingHumanizeQn(busIndex, stepIndex, cycle);
+            const double nextOnQn =
+                cycleStartQn +
+                static_cast<double>(stepIndex + stepsToNextHit) * kStepQuarterNotes +
+                timingHumanizeQn(busIndex, nextStepIndex, nextCycle);
+            const double latestOffQn =
+                std::max(onQn + qnPerSample, nextOnQn - kSustainGapQn);
+
+            for (int n = 0; n < step.noteCount; ++n) {
+                const auto& note = step.notes[n];
+                // Guitar and Bass are sustained performance lanes. Keep each
+                // note alive until immediately before the next onset; the
+                // deliberate 1/64-note gap prevents overlap while avoiding
+                // audible holes. Articulation is encoded by the generated
+                // velocity/chord content, not by prematurely shortening gates.
+                const double offQn = latestOffQn;
+                addScheduled(
+                    onQn, true, note.pitch,
+                    humanizedVelocity(busIndex, stepIndex, cycle, note.velocity),
+                    busIndex, offQn, stepIndex, n);
+                addScheduled(offQn, false, note.pitch, 0, busIndex);
+            }
+        }
+    };
+
+    auto scheduleDrumCycle = [&](double cycleStartQn, long long cycle) {
+        constexpr double kDrumGateQn = kStepQuarterNotes; // exact 1/16-note gate
+        for (int stepIndex = 0; stepIndex < drumPhrase_.usedSteps(); ++stepIndex) {
+            const auto& step = drumPhrase_.steps[stepIndex];
+            if (step.hitCount <= 0)
+                continue;
+            const double onQn =
+                cycleStartQn + static_cast<double>(stepIndex) * kStepQuarterNotes +
+                timingHumanizeQn(kDrumsOutBus, stepIndex, cycle);
+            for (int n = 0; n < step.hitCount; ++n) {
+                const auto& hit = step.hits[n];
+                const int pitch = drumMap_.midiNote(hit.voice);
+                double offQn = onQn + kDrumGateQn;
+
+                if (humanizeAmount_ > 0.0f) {
+                    for (int delta = 1; delta <= drumPhrase_.usedSteps(); ++delta) {
+                        const int nextIndex =
+                            (stepIndex + delta) % drumPhrase_.usedSteps();
+                        bool samePitch = false;
+                        for (int h = 0;
+                             h < drumPhrase_.steps[nextIndex].hitCount; ++h) {
+                            if (drumMap_.midiNote(
+                                    drumPhrase_.steps[nextIndex].hits[h].voice) ==
+                                pitch) {
+                                samePitch = true;
+                                break;
+                            }
+                        }
+                        if (!samePitch)
+                            continue;
+                        const long long nextCycle =
+                            cycle + ((stepIndex + delta) >=
+                                     drumPhrase_.usedSteps() ? 1 : 0);
+                        const double nextOnQn =
+                            cycleStartQn +
+                            static_cast<double>(stepIndex + delta) *
+                                kStepQuarterNotes +
+                            timingHumanizeQn(
+                                kDrumsOutBus, nextIndex, nextCycle);
+                        offQn = std::min(offQn, nextOnQn - qnPerSample);
+                        break;
+                    }
+                    offQn = std::max(onQn + qnPerSample, offQn);
+                }
+
+                addScheduled(
+                    onQn, true, pitch,
+                    humanizedVelocity(
+                        kDrumsOutBus, stepIndex, cycle, hit.velocity),
+                    kDrumsOutBus, offQn);
+                addScheduled(offQn, false, pitch, 0, kDrumsOutBus);
+            }
+        }
+    };
+
+    auto schedulePadCycle = [&](double cycleStartQn, long long cycle) {
+        constexpr double kPadReleaseGapQn = 1.0 / 16.0; // 1/64-note gap
+        const int usedSteps = padPhrase_.usedSteps();
+
+        for (int stepIndex = 0; stepIndex < usedSteps; ++stepIndex) {
+            const auto& step = padPhrase_.steps[stepIndex];
+            if (step.noteCount <= 0)
+                continue;
+
+            int stepsToNextChord = usedSteps;
+            for (int delta = 1; delta <= usedSteps; ++delta) {
+                const int nextIndex = (stepIndex + delta) % usedSteps;
+                if (padPhrase_.steps[nextIndex].noteCount > 0) {
+                    stepsToNextChord = delta;
+                    break;
+                }
+            }
+
+            const int nextStepIndex =
+                (stepIndex + stepsToNextChord) % usedSteps;
+            const long long nextCycle =
+                cycle + ((stepIndex + stepsToNextChord) >= usedSteps ? 1 : 0);
+            const double onQn =
+                cycleStartQn + static_cast<double>(stepIndex) * kStepQuarterNotes +
+                timingHumanizeQn(kPadOutBus, stepIndex, cycle);
+            const double nextChordQn =
+                cycleStartQn +
+                static_cast<double>(stepIndex + stepsToNextChord) *
+                    kStepQuarterNotes +
+                timingHumanizeQn(kPadOutBus, nextStepIndex, nextCycle);
+            const double latestOffQn =
+                std::max(onQn + qnPerSample,
+                         nextChordQn - kPadReleaseGapQn);
+
+            for (int n = 0; n < step.noteCount; ++n) {
+                const auto& note = step.notes[n];
+                const double requestedOffQn =
+                    onQn + static_cast<double>(std::max(1, note.lengthSteps)) *
+                               kStepQuarterNotes - kPadReleaseGapQn;
+                const double offQn =
+                    std::max(onQn, std::min(latestOffQn, requestedOffQn));
+                addScheduled(
+                    onQn, true, note.pitch,
+                    humanizedVelocity(
+                        kPadOutBus, stepIndex, cycle, note.velocity),
+                    kPadOutBus, offQn, stepIndex, n);
+                addScheduled(offQn, false, note.pitch, 0, kPadOutBus);
+            }
+        }
+    };
+
+    auto scheduleSynthCycle = [&](double cycleStartQn, long long cycle) {
+        const int usedSteps = synthPhrase_.usedSteps();
+
+        for (int stepIndex = 0; stepIndex < usedSteps; ++stepIndex) {
+            const auto& step = synthPhrase_.steps[stepIndex];
+            if (step.noteCount <= 0)
+                continue;
+
+            int stepsToNextHit = usedSteps;
+            for (int delta = 1; delta <= usedSteps; ++delta) {
+                const int nextIndex = (stepIndex + delta) % usedSteps;
+                if (synthPhrase_.steps[nextIndex].noteCount > 0) {
+                    stepsToNextHit = delta;
+                    break;
+                }
+            }
+
+            const int nextStepIndex =
+                (stepIndex + stepsToNextHit) % usedSteps;
+            const long long nextCycle =
+                cycle + ((stepIndex + stepsToNextHit) >= usedSteps ? 1 : 0);
+            const double onQn =
+                cycleStartQn + static_cast<double>(stepIndex) * kStepQuarterNotes +
+                timingHumanizeQn(kSynthOutBus, stepIndex, cycle);
+            const double nextOnQn =
+                cycleStartQn +
+                static_cast<double>(stepIndex + stepsToNextHit) *
+                    kStepQuarterNotes +
+                timingHumanizeQn(kSynthOutBus, nextStepIndex, nextCycle);
+
+            // Synth articulation is independent of Guitar/Bass/Pad gating.
+            // Honor the generated note length and allow a legato boundary at
+            // the next monophonic onset. Same-sample NoteOff is sorted first.
+            for (int n = 0; n < step.noteCount; ++n) {
+                const auto& note = step.notes[n];
+                const double requestedOffQn =
+                    onQn + static_cast<double>(std::max(1, note.lengthSteps)) *
+                               kStepQuarterNotes;
+                const double safeNextQn =
+                    humanizeAmount_ > 0.0f ? nextOnQn - qnPerSample : nextOnQn;
+                const double offQn =
+                    std::max(onQn + qnPerSample,
+                             std::min(safeNextQn, requestedOffQn));
+                addScheduled(
+                    onQn, true, note.pitch,
+                    humanizedVelocity(
+                        kSynthOutBus, stepIndex, cycle, note.velocity),
+                    kSynthOutBus, offQn, stepIndex, n);
+                addScheduled(offQn, false, note.pitch, 0, kSynthOutBus);
+            }
+        }
+    };
+
+    int triggerTransitionIndex = 0;
+    bool triggerGateOpen =
+        !midiNoteTrigger_ || triggerOpenAtBlockStart;
+
+    auto applyTriggerTransitionsThrough = [&](int32 sampleOffset) {
+        if (!midiNoteTrigger_)
+            return true;
+
+        while (triggerTransitionIndex < triggerTransitionCount &&
+               triggerTransitions[triggerTransitionIndex].sampleOffset <= sampleOffset) {
+            const auto transition =
+                triggerTransitions[triggerTransitionIndex++];
+            if (!transition.openAfter) {
+                const double transitionQn =
+                    blockStartQn +
+                    static_cast<double>(transition.sampleOffset) * qnPerSample;
+                if (!flushActiveNotes(
+                        data.outputEvents, transitionQn, false,
+                        transition.sampleOffset))
+                    return false;
+            }
+            triggerGateOpen = transition.openAfter;
+        }
+        return true;
+    };
+
+    auto emitScheduled = [&]() {
+        std::sort(scheduled.begin(), scheduled.begin() + scheduledCount,
+                  [](const ScheduledEvent& a, const ScheduledEvent& b) {
+                      if (a.sampleOffset != b.sampleOffset)
+                          return a.sampleOffset < b.sampleOffset;
+                      if (a.noteOn != b.noteOn)
+                          return !a.noteOn;
+                      if (a.busIndex != b.busIndex)
+                          return a.busIndex < b.busIndex;
+                      return a.pitch < b.pitch;
+                  });
+
+        bool allDelivered = true;
+        for (int i = 0; i < scheduledCount; ++i) {
+            const auto& s = scheduled[i];
+
+            if (!applyTriggerTransitionsThrough(s.sampleOffset))
+                return false;
+
+            if (midiNoteTrigger_) {
+                const bool active =
+                    activePitchesByBus_[static_cast<size_t>(s.busIndex)]
+                                       [static_cast<size_t>(s.pitch)];
+                if (s.noteOn && !triggerGateOpen)
+                    continue;
+                if (!s.noteOn && !triggerGateOpen && !active)
+                    continue;
+            }
+
+            Event e{};
+            e.busIndex = s.busIndex;
+            e.sampleOffset = s.sampleOffset;
+            e.ppqPosition = s.ppqPosition;
+
+            if (s.noteOn) {
+                e.type = Event::kNoteOnEvent;
+                e.noteOn.channel = 0;
+                e.noteOn.pitch = static_cast<int16>(s.pitch);
+                e.noteOn.velocity = static_cast<float>(s.velocity) / 127.0f;
+                e.noteOn.length = s.noteLengthSamples;
+                e.noteOn.tuning = 0.0f;
+                e.noteOn.noteId = -1;
+
+                if (data.outputEvents->addEvent(e) == kResultOk) {
+                    activePitchesByBus_[static_cast<size_t>(s.busIndex)][s.pitch] = true;
+                    activeVelocitiesByBus_[static_cast<size_t>(s.busIndex)][s.pitch] = s.velocity;
+                    activeStepByBus_[static_cast<size_t>(s.busIndex)][s.pitch] = s.stepIndex;
+                    activeVoiceByBus_[static_cast<size_t>(s.busIndex)][s.pitch] = s.noteIndex;
+                } else {
+                    allDelivered = false;
+                }
+            } else {
+                e.type = Event::kNoteOffEvent;
+                e.noteOff.channel = 0;
+                e.noteOff.pitch = static_cast<int16>(s.pitch);
+                e.noteOff.velocity = 0.0f;
+                e.noteOff.noteId = -1;
+
+                if (data.outputEvents->addEvent(e) == kResultOk) {
+                    activePitchesByBus_[static_cast<size_t>(s.busIndex)][s.pitch] = false;
+                    activeVelocitiesByBus_[static_cast<size_t>(s.busIndex)][s.pitch] = 0;
+                    activeStepByBus_[static_cast<size_t>(s.busIndex)][s.pitch] = -1;
+                    activeVoiceByBus_[static_cast<size_t>(s.busIndex)][s.pitch] = -1;
+                } else {
+                    allDelivered = false;
+                }
+            }
+        }
+        return allDelivered;
+    };
+
+    // Stage and emit one musical cycle at a time. The fixed array therefore
+    // bounds realtime memory by per-cycle musical complexity rather than by
+    // the host's offline block length. Extremely large offline blocks can span
+    // arbitrarily many cycles without accumulating all events in one buffer.
+    for (long long cycle = firstCycle; cycle <= lastCycle; ++cycle) {
+        scheduledCount = 0;
+        schedulerOverflow = false;
+
+        const double cycleStartQn =
+            transportAnchorQn_ + static_cast<double>(cycle) * patternLengthQn;
+
+        schedulePhraseCycle(phrase_, kGuitarOutBus, cycleStartQn, cycle);
+        schedulePhraseCycle(bassPhrase_, kBassOutBus, cycleStartQn, cycle);
+        scheduleDrumCycle(cycleStartQn, cycle);
+        schedulePadCycle(cycleStartQn, cycle);
+        scheduleSynthCycle(cycleStartQn, cycle);
+
+        if (schedulerOverflow) {
+            // This now represents excessive complexity inside one single
+            // musical cycle, not merely a large host block.
+            phraseChangedNeedsFlush_ =
+                !flushActiveNotes(data.outputEvents, blockStartQn);
+            return kResultFalse;
+        }
+
+        if (!emitScheduled()) {
+            // Keep only successfully delivered NoteOns in the active set, and
+            // force a cleanup pass before any further musical events.
+            phraseChangedNeedsFlush_ = true;
+            return kResultFalse;
+        }
+    }
+
+    if (!applyTriggerTransitionsThrough(std::max<int32>(0, data.numSamples - 1))) {
+        phraseChangedNeedsFlush_ = true;
+        return kResultFalse;
+    }
+
+    return kResultOk;
+}
+
+tresult PLUGIN_API MidiatorController::initialize(FUnknown* context) {
+    auto r = EditControllerEx1::initialize(context);
+    if (r != kResultOk)
+        return r;
+
+    auto* root = new StringListParameter(STR16("Root"), kRootId);
+    const char16_t* roots[] = {
+        STR16("C"), STR16("C#"), STR16("D"), STR16("D#"), STR16("E"), STR16("F"),
+        STR16("F#"), STR16("G"), STR16("G#"), STR16("A"), STR16("A#"), STR16("B")
+    };
+    for (auto* s : roots)
+        root->appendString(s);
+    root->getInfo().defaultNormalizedValue = 9.0 / 11.0;
+    root->setNormalized(root->getInfo().defaultNormalizedValue);
+    parameters.addParameter(root);
+
+    auto* rootSource = new StringListParameter(STR16("Root Source"), kRootSourceId);
+    rootSource->appendString(STR16("Manual"));
+    rootSource->appendString(STR16("MIDI"));
+    rootSource->getInfo().defaultNormalizedValue = 1.0;
+    rootSource->setNormalized(1.0);
+    parameters.addParameter(rootSource);
+
+    // Controller display of the processor's *actual* pitch-class root.
+    // It is never part of the user's automation or MIDI generator state.
+    auto* liveRoot = new StringListParameter(STR16("Effective MIDI Root"), kLiveRootId);
+    for (auto* name : roots) liveRoot->appendString(name);
+    liveRoot->getInfo().defaultNormalizedValue = 9.0 / 11.0;
+    liveRoot->getInfo().flags |= ParameterInfo::kIsReadOnly | ParameterInfo::kIsHidden;
+    liveRoot->getInfo().flags &= ~ParameterInfo::kCanAutomate;
+    liveRoot->setNormalized(9.0 / 11.0);
+    parameters.addParameter(liveRoot);
+
+    auto* legacyStyle = new StringListParameter(STR16("Riff Style (Legacy)"), kStyleId);
+    legacyStyle->appendString(STR16("NDH / Industrial"));
+    legacyStyle->appendString(STR16("Dark Rock / Gothic"));
+    legacyStyle->appendString(STR16("Heavy Industrial"));
+    legacyStyle->getInfo().defaultNormalizedValue = 0.0;
+    legacyStyle->setNormalized(0.0);
+    legacyStyle->getInfo().flags |= ParameterInfo::kIsHidden;
+    parameters.addParameter(legacyStyle);
+
+    auto* style = new StringListParameter(STR16("Metal Style"), kMetalStyleId);
+    style->appendString(STR16("NDH / Industrial"));
+    style->appendString(STR16("Dark Rock / Gothic"));
+    style->appendString(STR16("Heavy Industrial"));
+    style->appendString(STR16("Classic Heavy Metal"));
+    style->appendString(STR16("Thrash Metal"));
+    style->appendString(STR16("Groove Metal"));
+    style->appendString(STR16("Death Metal"));
+    style->appendString(STR16("Melodic Death Metal"));
+    style->appendString(STR16("Metalcore"));
+    style->appendString(STR16("Nu Metal"));
+    style->appendString(STR16("Doom Metal"));
+    style->appendString(STR16("Djent / Progressive"));
+    style->getInfo().defaultNormalizedValue = 0.0;
+    style->setNormalized(0.0);
+    parameters.addParameter(style);
+
+    auto* scale = new StringListParameter(STR16("Scale / Mode"), kScaleId);
+    scale->appendString(STR16("Natural Minor"));
+    scale->appendString(STR16("Phrygian"));
+    scale->appendString(STR16("Dorian"));
+    scale->appendString(STR16("Harmonic Minor"));
+    scale->appendString(STR16("Phrygian Dominant"));
+    scale->appendString(STR16("Minor Pentatonic"));
+    scale->appendString(STR16("Blues"));
+    scale->getInfo().defaultNormalizedValue = 1.0 / 6.0;
+    scale->setNormalized(scale->getInfo().defaultNormalizedValue);
+    parameters.addParameter(scale);
+
+    auto* bars = new StringListParameter(STR16("Bars (Legacy)"), kBarsId);
+    bars->appendString(STR16("1"));
+    bars->appendString(STR16("2"));
+    bars->appendString(STR16("4"));
+    bars->appendString(STR16("8"));
+    bars->getInfo().defaultNormalizedValue = 1.0 / 3.0;
+    bars->setNormalized(bars->getInfo().defaultNormalizedValue);
+    parameters.addParameter(bars);
+
+    auto* sectionLength =
+        new StringListParameter(STR16("Section Length"), kSectionLengthId);
+    sectionLength->appendString(STR16("1"));
+    sectionLength->appendString(STR16("2"));
+    sectionLength->appendString(STR16("4"));
+    sectionLength->appendString(STR16("8"));
+    sectionLength->appendString(STR16("16"));
+    sectionLength->getInfo().defaultNormalizedValue = 0.75;
+    sectionLength->setNormalized(0.75);
+    parameters.addParameter(sectionLength);
+
+    auto* sectionType =
+        new StringListParameter(STR16("Section"), kSectionTypeId);
+    sectionType->appendString(STR16("FREE"));
+    sectionType->appendString(STR16("INTRO"));
+    sectionType->appendString(STR16("VERSE"));
+    sectionType->appendString(STR16("PRE"));
+    sectionType->appendString(STR16("CHORUS"));
+    sectionType->appendString(STR16("BREAKDOWN"));
+    sectionType->appendString(STR16("OUTRO"));
+    sectionType->getInfo().defaultNormalizedValue = 0.0;
+    sectionType->setNormalized(0.0);
+    parameters.addParameter(sectionType);
+
+    auto addPercent = [&](const char16_t* name, ParamID id, double defaultValue) {
+        auto* p = new RangeParameter(name, id, STR16("%"), 0.0, 100.0, defaultValue, 0,
+                                     ParameterInfo::kCanAutomate);
+        p->setPrecision(0);
+        parameters.addParameter(p);
+    };
+
+    addPercent(STR16("Density"), kDensityId, 56.0);
+    addPercent(STR16("Complexity"), kComplexityId, 42.0);
+    addPercent(STR16("Repetition"), kRepetitionId, 72.0);
+    auto* drumMap = new StringListParameter(
+        STR16("Drum Map (Legacy)"), kDrumMapId);
+    drumMap->appendString(STR16("General MIDI"));
+    drumMap->appendString(STR16("EZdrummer 3"));
+    drumMap->appendString(STR16("Perfect Drums"));
+    drumMap->getInfo().defaultNormalizedValue = 0.0;
+    drumMap->setNormalized(0.0);
+    drumMap->getInfo().flags |= ParameterInfo::kIsHidden;
+    parameters.addParameter(drumMap);
+
+    auto* verifiedDrumMap = new StringListParameter(
+        STR16("Drum Map"), kVerifiedDrumMapId);
+    verifiedDrumMap->appendString(STR16("General MIDI"));
+    verifiedDrumMap->appendString(STR16("EZdrummer 3"));
+    verifiedDrumMap->appendString(STR16("Perfect Drums"));
+    verifiedDrumMap->appendString(STR16("Addictive Drums 2"));
+    verifiedDrumMap->getInfo().defaultNormalizedValue = 0.0;
+    verifiedDrumMap->setNormalized(0.0);
+    parameters.addParameter(verifiedDrumMap);
+
+    auto* powerChordsEnabled = new StringListParameter(STR16("Power Chords"), kPowerChordsEnabledId);
+    powerChordsEnabled->appendString(STR16("OFF"));
+    powerChordsEnabled->appendString(STR16("ON"));
+    powerChordsEnabled->getInfo().defaultNormalizedValue = 1.0;
+    powerChordsEnabled->setNormalized(1.0);
+    parameters.addParameter(powerChordsEnabled);
+
+    addPercent(STR16("Power Chords Amount"), kPowerChordId, 25.0);
+    addPercent(STR16("Palm Mute"), kPalmMuteId, 70.0);
+    auto* pmVelocity = new RangeParameter(
+        STR16("PM < Velocity"), kPalmMuteVelocityId, STR16(""),
+        3.0, 87.0, 30.0, 84, ParameterInfo::kCanAutomate);
+    pmVelocity->setPrecision(0);
+    parameters.addParameter(pmVelocity);
+    addPercent(STR16("Variation Amount"), kVariationAmountId, 35.0);
+    addPercent(STR16("Bass Follow"), kBassFollowId, 72.0);
+    addPercent(STR16("Bass Movement"), kBassMovementId, 34.0);
+    addPercent(STR16("Drum Density"), kDrumDensityId, 48.0);
+    addPercent(STR16("Drum Complexity"), kDrumComplexityId, 30.0);
+    addPercent(STR16("Fill Intensity"), kFillIntensityId, 50.0);
+    addPercent(STR16("Pad Spread"), kPadSpreadId, 42.0);
+    addPercent(STR16("Pad Tension"), kPadTensionId, 18.0);
+    addPercent(STR16("Synth Activity"), kSynthActivityId, 46.0);
+    addPercent(STR16("Synth Movement"), kSynthMovementId, 42.0);
+
+    auto* triggerMode = new StringListParameter(STR16("Trigger"), kTriggerModeId);
+    triggerMode->appendString(STR16("TRANSPORT"));
+    triggerMode->appendString(STR16("MIDI NOTE"));
+    triggerMode->getInfo().defaultNormalizedValue = 0.0;
+    triggerMode->setNormalized(0.0);
+    parameters.addParameter(triggerMode);
+
+    auto addRoleLock = [&](const char16_t* name, ParamID id) {
+        auto* p = new StringListParameter(name, id);
+        p->appendString(STR16("OPEN"));
+        p->appendString(STR16("LOCK"));
+        p->getInfo().defaultNormalizedValue = 0.0;
+        p->setNormalized(0.0);
+        parameters.addParameter(p);
+    };
+    addRoleLock(STR16("Guitar Lock"), kGuitarLockId);
+    addRoleLock(STR16("Bass Lock"), kBassLockId);
+    addRoleLock(STR16("Drums Lock"), kDrumsLockId);
+    addRoleLock(STR16("Pad Lock"), kPadLockId);
+    addRoleLock(STR16("Synth Lock"), kSynthLockId);
+    addPercent(STR16("Humanize"), kHumanizeId, 0.0);
+
+    auto* newRiff = new RangeParameter(STR16("NEW Riff"), kNewRiffId, STR16(""),
+                                       0.0, 1.0, 0.0, 1, ParameterInfo::kCanAutomate);
+    parameters.addParameter(newRiff);
+
+    auto* variation = new RangeParameter(STR16("VARIATION"), kVariationId, STR16(""),
+                                         0.0, 1.0, 0.0, 1, ParameterInfo::kCanAutomate);
+    parameters.addParameter(variation);
+
+    return kResultOk;
+}
+
+void MidiatorController::valueChanged(VSTGUI::CControl* control) {
+    if (!control || control->getValueNormalized() <= 0.5f)
+        return;
+    if (control->getTag() == 901) {
+        detailsShown_ = !detailsShown_;
+        refreshDetailsPage();
+        return;
+    }
+    if (control->getTag() == 900) {
+        zoomIndex_ = (zoomIndex_ + 1) % static_cast<int>(kGuiZoomLevels.size());
+        zoomFactor_ = kGuiZoomLevels[static_cast<size_t>(zoomIndex_)];
+        refreshZoomButton();
+        if (activeEditor_)
+            activeEditor_->setZoomFactor(zoomFactor_);
+        return;
+    }
+
+    const auto tag = static_cast<ParamID>(control->getTag());
+    const char* messageId = nullptr;
+    double* fallbackState = nullptr;
+
+    if (tag == kNewRiffId) {
+        messageId = kMsgNewRiff;
+        fallbackState = &fallbackNewRiffState_;
+    } else if (tag == kVariationId) {
+        messageId = kMsgVariation;
+        fallbackState = &fallbackVariationState_;
+    } else {
+        return;
+    }
+
+    // Primary path: explicit controller -> processor command message.
+    if (sendMessageID(messageId) == kResultOk)
+        return;
+
+    // Fallback for a host that does not connect the two VST3 connection
+    // points: alternate the action parameter so the processor still receives
+    // a real changed final value.
+    *fallbackState = (*fallbackState > 0.5) ? 0.0 : 1.0;
+    beginEdit(tag);
+    performEdit(tag, *fallbackState);
+    endEdit(tag);
+}
+
+// VST3 controller state belongs to the host project, independent of the
+// processor's MIDI arrangement/state payload. No processor state version bump.
+tresult PLUGIN_API MidiatorController::getState(IBStream* state) {
+    if (!state)
+        return kInvalidArgument;
+    return writeValue(state, kControllerStateMagic) &&
+                   writeValue(state, kControllerStateVersion) &&
+                   writeValue(state, zoomFactor_)
+        ? kResultOk : kResultFalse;
+}
+
+tresult PLUGIN_API MidiatorController::setState(IBStream* state) {
+    if (!state)
+        return kInvalidArgument;
+    uint32_t magic = 0;
+    uint32_t version = 0;
+    double restoredZoom = 1.0;
+    if (!readValue(state, magic) || !readValue(state, version) ||
+        !readValue(state, restoredZoom) ||
+        magic != kControllerStateMagic || version != kControllerStateVersion ||
+        !std::isfinite(restoredZoom) || restoredZoom < 0.8 ||
+        restoredZoom > 1.5)
+        return kResultFalse;
+
+    // Calling onZoomChanged also synchronizes the next Zoom-button action.
+    onZoomChanged(activeEditor_, restoredZoom);
+    if (activeEditor_)
+        activeEditor_->setZoomFactor(restoredZoom);
+    return kResultOk;
+}
+
+tresult PLUGIN_API MidiatorController::setComponentState(IBStream* state) {
+    if (!state)
+        return kInvalidArgument;
+
+    midiator::GeneratorSettings restored{};
+    float variationAmount = 0.35f;
+    uint32_t seed = 0;
+    int manualRoot = restored.rootPitchClass;
+    bool midiRootSource = true;
+    bool powerChordsEnabled = true;
+    bool midiNoteTrigger = false;
+    std::array<bool, kEventOutputBusCount> roleLocks{};
+    float humanizeAmount = 0.0f;
+    midiator::DrumMapId drumMapId = midiator::DrumMapId::GeneralMidi;
+    midiator::BassSettings bassSettings{};
+    midiator::DrumSettings drumSettings{};
+    midiator::PadSettings padSettings{};
+    midiator::SynthSettings synthSettings{};
+    uint32_t restoredStateVersion = 0;
+    if (!readStateHeader(state, restoredStateVersion, restored, variationAmount, seed,
+                         manualRoot, midiRootSource, powerChordsEnabled, drumMapId,
+                         bassSettings, drumSettings, padSettings, synthSettings))
+        return kResultFalse;
+
+    if (restoredStateVersion >= 13u) {
+        midiator::Phrase tempGuitar{}, tempBass{}, tempSynth{};
+        midiator::DrumPhrase tempDrums{};
+        midiator::PadPhrase tempPads{};
+        const int serializedSteps =
+            restoredStateVersion >= 8u ? midiator::kMaxSteps : kLegacyStateSteps;
+        const bool allow16Bars = restoredStateVersion >= 8u;
+        if (!readPhraseState(state, tempGuitar, restored.bars,
+                             serializedSteps, allow16Bars, true) ||
+            !readPhraseState(state, tempBass, restored.bars,
+                             serializedSteps, allow16Bars, true) ||
+            !readDrumPhraseState(state, tempDrums, restored.bars,
+                                 serializedSteps, allow16Bars, true) ||
+            !readPadPhraseState(state, tempPads, restored.bars,
+                                serializedSteps, allow16Bars, true) ||
+            !readPhraseState(state, tempSynth, restored.bars,
+                             serializedSteps, allow16Bars, true) ||
+            !readExtendedStateTail(
+                state, restoredStateVersion, restored.palmMuteVelocityThreshold,
+                midiNoteTrigger, roleLocks, humanizeAmount))
+            return kResultFalse;
+    } else {
+        restored.palmMuteVelocityThreshold = 41;
+        midiNoteTrigger = false;
+        roleLocks.fill(false);
+        humanizeAmount = 0.0f;
+    }
+
+    auto legacyBarsIndex = [](int bars) -> double {
+        switch (bars) {
+            case 1: return 0.0;
+            case 2: return 1.0 / 3.0;
+            case 4: return 2.0 / 3.0;
+            case 8:
+            case 16: return 1.0;
+            default: return 1.0 / 3.0;
+        }
+    };
+    auto sectionBarsIndex = [](int bars) -> double {
+        switch (bars) {
+            case 1: return 0.0;
+            case 2: return 0.25;
+            case 4: return 0.50;
+            case 8: return 0.75;
+            case 16: return 1.0;
+            default: return 0.25;
+        }
+    };
+
+    setParamNormalized(kRootId, static_cast<double>(manualRoot) / 11.0);
+    setParamNormalized(kLiveRootId, static_cast<double>(restored.rootPitchClass) / 11.0);
+    setParamNormalized(kRootSourceId, midiRootSource ? 1.0 : 0.0);
+    setParamNormalized(kPowerChordsEnabledId, powerChordsEnabled ? 1.0 : 0.0);
+    const double legacyDrumMapNormalized =
+        drumMapId == midiator::DrumMapId::EZdrummer3 ? 0.5 :
+        (drumMapId == midiator::DrumMapId::PerfectDrums ? 1.0 : 0.0);
+    setParamNormalized(kDrumMapId, legacyDrumMapNormalized);
+    double verifiedDrumMapNormalized = 0.0;
+    if (drumMapId == midiator::DrumMapId::EZdrummer3)
+        verifiedDrumMapNormalized = 1.0 / 3.0;
+    else if (drumMapId == midiator::DrumMapId::PerfectDrums)
+        verifiedDrumMapNormalized = 2.0 / 3.0;
+    else if (drumMapId == midiator::DrumMapId::AddictiveDrums2)
+        verifiedDrumMapNormalized = 1.0;
+    setParamNormalized(kVerifiedDrumMapId, verifiedDrumMapNormalized);
+    const int restoredStyleIndex = static_cast<int>(restored.style);
+    const int legacyStyleIndex =
+        restoredStyleIndex >= 0 && restoredStyleIndex < 3 ? restoredStyleIndex : 0;
+    setParamNormalized(kStyleId, static_cast<double>(legacyStyleIndex) / 2.0);
+    setParamNormalized(
+        kMetalStyleId,
+        static_cast<double>(restoredStyleIndex) /
+        static_cast<double>(static_cast<int>(midiator::StyleId::Count) - 1));
+    setParamNormalized(kScaleId, static_cast<double>(static_cast<int>(restored.scale)) /
+                                  static_cast<double>(static_cast<int>(midiator::ScaleId::Count) - 1));
+    setParamNormalized(kBarsId, legacyBarsIndex(restored.bars));
+    setParamNormalized(kSectionLengthId, sectionBarsIndex(restored.bars));
+    setParamNormalized(
+        kSectionTypeId,
+        static_cast<double>(static_cast<int>(restored.section)) /
+        static_cast<double>(static_cast<int>(midiator::SectionType::Count) - 1));
+    setParamNormalized(kDensityId, restored.density);
+    setParamNormalized(kComplexityId, restored.complexity);
+    setParamNormalized(kRepetitionId, restored.repetition);
+    setParamNormalized(kPowerChordId, restored.powerChordChance);
+    setParamNormalized(kPalmMuteId, restored.palmMuteChance);
+    setParamNormalized(kPalmMuteVelocityId,
+                       static_cast<double>(restored.palmMuteVelocityThreshold - 3) / 84.0);
+    setParamNormalized(kTriggerModeId, midiNoteTrigger ? 1.0 : 0.0);
+    setParamNormalized(kGuitarLockId, roleLocks[kGuitarOutBus] ? 1.0 : 0.0);
+    setParamNormalized(kBassLockId, roleLocks[kBassOutBus] ? 1.0 : 0.0);
+    setParamNormalized(kDrumsLockId, roleLocks[kDrumsOutBus] ? 1.0 : 0.0);
+    setParamNormalized(kPadLockId, roleLocks[kPadOutBus] ? 1.0 : 0.0);
+    setParamNormalized(kSynthLockId, roleLocks[kSynthOutBus] ? 1.0 : 0.0);
+    setParamNormalized(kHumanizeId, humanizeAmount);
+    setParamNormalized(kVariationAmountId, variationAmount);
+    setParamNormalized(kBassFollowId, bassSettings.follow);
+    setParamNormalized(kBassMovementId, bassSettings.movement);
+    setParamNormalized(kDrumDensityId, drumSettings.density);
+    setParamNormalized(kDrumComplexityId, drumSettings.complexity);
+    setParamNormalized(kFillIntensityId, drumSettings.fillIntensity);
+    setParamNormalized(kPadSpreadId, padSettings.spread);
+    setParamNormalized(kPadTensionId, padSettings.tension);
+    setParamNormalized(kSynthActivityId, synthSettings.activity);
+    setParamNormalized(kSynthMovementId, synthSettings.movement);
+
+    return kResultOk;
+}
+
+
+tresult PLUGIN_API MidiatorController::setParamNormalized(ParamID tag, ParamValue value) {
+    const auto r = EditControllerEx1::setParamNormalized(tag, value);
+    if (tag == kRootId || tag == kLiveRootId ||
+        tag == kRootSourceId || tag == kScaleId)
+        refreshTheory();
+    if (tag == kStyleId || tag == kMetalStyleId)
+        refreshStyleHint();
+    if (tag == kPowerChordsEnabledId ||
+        (tag >= kGuitarLockId && tag <= kSynthLockId))
+        refreshToggleLabels();
+    return r;
+}
+
+IPlugView* PLUGIN_API MidiatorController::createView(FIDString name) {
+    if (name && std::strcmp(name, ViewType::kEditor) == 0) {
+        auto* editor = new VSTGUI::AspectRatioVST3Editor(
+            this, "MidiatorView", "midiator.uidesc");
+        editor->setDelegate(this);
+        editor->setMinZoomFactor(0.8);
+        editor->setAllowedZoomFactors({0.8, 1.0, 1.2, 1.5});
+        editor->setZoomFactor(zoomFactor_);
+        return editor;
+    }
+    return nullptr;
+}
+
+VSTGUI::CView* MidiatorController::verifyView(VSTGUI::CView* view,
+                                              const VSTGUI::UIAttributes& attributes,
+                                              const VSTGUI::IUIDescription*,
+                                              VSTGUI::VST3Editor* editor) {
+    if (!view)
+        return nullptr;
+    activeEditor_ = editor;
+
+    if (auto* control = dynamic_cast<VSTGUI::CControl*>(view)) {
+        if (control->getTag() == 900) {
+            control->setListener(this);
+            zoomButton_ = dynamic_cast<VSTGUI::CTextButton*>(control);
+            refreshZoomButton();
+        }
+        if (control->getTag() == 901) {
+            control->setListener(this);
+            detailsButton_ = dynamic_cast<VSTGUI::CTextButton*>(control);
+        }
+        if (control->getTag() == static_cast<int32_t>(kNewRiffId)) {
+            control->setListener(this);
+            newRiffButton_ = control;
+        } else if (control->getTag() == static_cast<int32_t>(kVariationId)) {
+            control->setListener(this);
+            variationButton_ = control;
+        }
+        if (auto* textButton = dynamic_cast<VSTGUI::CTextButton*>(control)) {
+            const auto tag = static_cast<ParamID>(control->getTag());
+            if (tag >= kGuitarLockId && tag <= kSynthLockId)
+                lockButtons_[static_cast<size_t>(tag - kGuitarLockId)] = textButton;
+            else if (tag == kPowerChordsEnabledId)
+                powerChordToggle_ = textButton;
+        }
+    }
+
+    const auto* id = attributes.getAttributeValue("midiator-id");
+    if (id) {
+        if (*id == "mainGenerate") mainGeneratePanel_ = view;
+        else if (*id == "mainLocks") mainLocksPanel_ = view;
+        else if (*id == "detailsPanel") detailsPanel_ = view;
+        if (auto* label = dynamic_cast<VSTGUI::CTextLabel*>(view)) {
+            if (*id == "theoryKey") theoryKey_ = label;
+            else if (*id == "theoryNotes") theoryNotes_ = label;
+            else if (*id == "theoryCharacter") theoryCharacter_ = label;
+            else if (*id == "theoryInterval") theoryInterval_ = label;
+            else if (*id == "styleBpm") styleBpm_ = label;
+        }
+    }
+
+    refreshTheory();
+    refreshStyleHint();
+    refreshToggleLabels();
+    refreshDetailsPage();
+    return view;
+}
+
+void MidiatorController::willClose(VSTGUI::VST3Editor* editor) {
+    // Capture host/window resize as well as Zoom-button changes before editor teardown.
+    if (editor)
+        onZoomChanged(editor, editor->getZoomFactor());
+    // verifyView stores raw pointers into the editor's view hierarchy.
+    // They become invalid as soon as the editor closes. Clearing them here
+    // prevents a second editor instance from touching freed views.
+    theoryKey_ = nullptr;
+    theoryNotes_ = nullptr;
+    theoryCharacter_ = nullptr;
+    theoryInterval_ = nullptr;
+    styleBpm_ = nullptr;
+    newRiffButton_ = nullptr;
+    variationButton_ = nullptr;
+    lockButtons_.fill(nullptr);
+    powerChordToggle_ = nullptr;
+    zoomButton_ = nullptr;
+    detailsButton_ = nullptr;
+    mainGeneratePanel_ = nullptr;
+    mainLocksPanel_ = nullptr;
+    detailsPanel_ = nullptr;
+    detailsShown_ = false;
+    activeEditor_ = nullptr;
+    // Keep zoomFactor_ / zoomIndex_ across close and reopen of this editor.
+}
+
+void MidiatorController::refreshZoomButton() noexcept {
+    if (!zoomButton_)
+        return;
+    const int percent = static_cast<int>(std::lround(zoomFactor_ * 100.0));
+    const std::string label = std::to_string(percent) + " %";
+    zoomButton_->setTitle(label.c_str());
+    zoomButton_->invalid();
+}
+
+void MidiatorController::onZoomChanged(VSTGUI::VST3Editor*, double zoom) {
+    if (!std::isfinite(zoom) || zoom < 0.8 || zoom > 1.5)
+        return;
+    zoomFactor_ = zoom;
+    // At an arbitrary host-resized factor, next click selects the next
+    // larger listed zoom, rather than skipping one by rounding to the nearest.
+    zoomIndex_ = 0;
+    for (size_t i = 1; i < kGuiZoomLevels.size(); ++i) {
+        if (kGuiZoomLevels[i] <= zoomFactor_ + 0.00001)
+            zoomIndex_ = static_cast<int>(i);
+    }
+    refreshZoomButton();
+}
+
+void MidiatorController::refreshDetailsPage() noexcept {
+    if (mainGeneratePanel_) mainGeneratePanel_->setVisible(!detailsShown_);
+    if (mainLocksPanel_) mainLocksPanel_->setVisible(!detailsShown_);
+    if (detailsPanel_) detailsPanel_->setVisible(detailsShown_);
+    if (detailsButton_) {
+        detailsButton_->setTitle(detailsShown_ ? "BACK" : "DETAILS");
+        detailsButton_->invalid();
+    }
+}
+
+void MidiatorController::refreshToggleLabels() noexcept {
+    for (size_t i = 0; i < lockButtons_.size(); ++i) {
+        auto* button = lockButtons_[i];
+        if (!button) continue;
+        const auto tag = static_cast<ParamID>(kGuitarLockId + i);
+        button->setTitle(getParamNormalized(tag) > 0.5 ? "LOCK" : "OPEN");
+        button->invalid();
+    }
+    if (powerChordToggle_) {
+        powerChordToggle_->setTitle(
+            getParamNormalized(kPowerChordsEnabledId) > 0.5 ? "ON" : "OFF");
+        powerChordToggle_->invalid();
+    }
+}
+
+void MidiatorController::refreshTheory() noexcept {
+    static constexpr const char* kNoteNames[] = {
+        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"
+    };
+
+    const bool midiSource = getParamNormalized(kRootSourceId) > 0.5;
+    const int root = normalizedIndex(
+        getParamNormalized(midiSource ? kLiveRootId : kRootId), 12);
+    const auto scaleId = static_cast<midiator::ScaleId>(
+        normalizedIndex(getParamNormalized(kScaleId), static_cast<int>(midiator::ScaleId::Count)));
+    const auto& def = midiator::RiffEngine::scaleDefinition(scaleId);
+
+    auto set = [](VSTGUI::CTextLabel* label, const std::string& value) {
+        if (!label) return;
+        label->setText(value.c_str());
+        label->invalid();
+    };
+
+    set(theoryKey_, std::string(kNoteNames[root]) + "  " + def.name +
+                        (midiSource ? "  [MIDI]" : ""));
+
+    // Spell the seven-note modes diatonically: e.g. A Phrygian has Bb, not A#.
+    // Pentatonic and blues patterns keep conventional chromatic note names.
+    static constexpr int kNaturalSemitones[] = {0, 2, 4, 5, 7, 9, 11};
+    static constexpr const char* kLetters[] = {"C", "D", "E", "F", "G", "A", "B"};
+    static constexpr int kRootLetter[] = {0, 0, 1, 1, 2, 3, 3, 4, 4, 5, 5, 6};
+    std::string notes = "Notes: ";
+    for (int i = 0; i < def.count; ++i) {
+        if (i) notes += "  ";
+        const int chromatic = (root + def.intervals[i]) % 12;
+        if (def.count == 7) {
+            const int letter = (kRootLetter[root] + i) % 7;
+            int accidental = (chromatic - kNaturalSemitones[letter] + 12) % 12;
+            if (accidental > 6) accidental -= 12;
+            // Unusual theoretical spellings outside double accidentals fall back.
+            if (accidental >= -2 && accidental <= 2) {
+                notes += kLetters[letter];
+                if (accidental == -2) notes += "bb";
+                else if (accidental == -1) notes += "b";
+                else if (accidental == 1) notes += "#";
+                else if (accidental == 2) notes += "##";
+                continue;
+            }
+        }
+        notes += kNoteNames[chromatic];
+    }
+    set(theoryNotes_, notes);
+    set(theoryCharacter_, std::string("Character: ") + def.character);
+    set(theoryInterval_, std::string("Signature: ") + def.characteristicInterval);
+}
+
+void MidiatorController::refreshStyleHint() noexcept {
+    if (!styleBpm_)
+        return;
+
+    int style = normalizedIndex(
+        getParamNormalized(kMetalStyleId),
+        static_cast<int>(midiator::StyleId::Count));
+    const int legacy = normalizedIndex(getParamNormalized(kStyleId), 3);
+    if (style == 0 && legacy != 0)
+        style = legacy;
+
+    static constexpr const char* kBpmHints[] = {
+        "SUGGESTED BPM 100-135",
+        "SUGGESTED BPM 80-120",
+        "SUGGESTED BPM 105-145",
+        "SUGGESTED BPM 110-160",
+        "SUGGESTED BPM 160-220",
+        "SUGGESTED BPM 85-130",
+        "SUGGESTED BPM 160-240",
+        "SUGGESTED BPM 140-200",
+        "SUGGESTED BPM 120-180",
+        "SUGGESTED BPM 80-120",
+        "SUGGESTED BPM 50-90",
+        "SUGGESTED BPM 90-160"
+    };
+
+    style = std::clamp(style, 0,
+        static_cast<int>(std::size(kBpmHints)) - 1);
+    styleBpm_->setText(kBpmHints[style]);
+    styleBpm_->invalid();
+}
+
+} // namespace Steinberg::Vst
+
+using namespace Steinberg;
+using namespace Steinberg::Vst;
+
+#ifndef MIDIATOR_NO_FACTORY
+BEGIN_FACTORY_DEF("125A", "https://github.com/challanger2000/125A-Midiator", "")
+DEF_CLASS2(INLINE_UID_FROM_FUID(ProcessorUID), PClassInfo::kManyInstances, kVstAudioEffectClass,
+           "125A Midiator", Vst::kDistributable, Vst::PlugType::kInstrumentSynth,
+           "1.0.0", kVstVersionString, MidiatorProcessor::createInstance)
+DEF_CLASS2(INLINE_UID_FROM_FUID(ControllerUID), PClassInfo::kManyInstances, kVstComponentControllerClass,
+           "125A Midiator Controller", 0, "", "1.0.0", kVstVersionString,
+           MidiatorController::createInstance)
+END_FACTORY
+#endif
