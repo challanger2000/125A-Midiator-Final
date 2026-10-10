@@ -1,5 +1,5 @@
 name: Midiator V1.0.0 Demo Release QA
-# QA revision: corrected DemoTimer and ProcessContext fixtures
+# QA revision: corrected DemoTimer, ProcessContext and Windows module fixtures
 
 on:
   push:
