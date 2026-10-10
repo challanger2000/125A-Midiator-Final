@@ -32,5 +32,6 @@ smtg_target_configure_version_file(Midiator)
 
 target_compile_definitions(Midiator
     PRIVATE
+        MIDIATOR_DEMO_BUILD=1
         $<$<CONFIG:Debug>:VSTGUI_LIVE_EDITING=1>
 )
