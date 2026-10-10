@@ -1,0 +1,354 @@
+#include "PadBrain.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+
+namespace midiator {
+namespace {
+
+struct Rng {
+    uint32_t state;
+    explicit Rng(uint32_t seed) : state(seed ? seed : 0x7f4a7c15u) {}
+    uint32_t nextU32() {
+        uint32_t x = state;
+        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+        state = x;
+        return x;
+    }
+    float unit() {
+        return static_cast<float>(nextU32() & 0x00ffffffu) /
+               static_cast<float>(0x01000000u);
+    }
+    bool chance(float p) {
+        return unit() < std::clamp(p, 0.0f, 1.0f);
+    }
+};
+
+int wrap12(int v) {
+    v %= 12;
+    return v < 0 ? v + 12 : v;
+}
+
+int nearestPitchForPc(int pc, int around) {
+    int best = around;
+    int bestDistance = 999;
+    for (int p = std::max(45, around - 18); p <= std::min(88, around + 18); ++p) {
+        if (wrap12(p) != wrap12(pc))
+            continue;
+        const int d = std::abs(p - around);
+        if (d < bestDistance) {
+            best = p;
+            bestDistance = d;
+        }
+    }
+    return best;
+}
+
+int degreePc(const PadSettings& s, int degree) {
+    const auto& scale = RiffEngine::scaleDefinition(s.scale);
+    degree %= scale.count;
+    if (degree < 0) degree += scale.count;
+    return wrap12(s.rootPitchClass + scale.intervals[degree]);
+}
+
+int nearestScaleTone(int pitch, const PadSettings& s) {
+    int best = pitch;
+    int bestDistance = 999;
+    for (int p = std::max(45, pitch - 6); p <= std::min(88, pitch + 6); ++p) {
+        if (!RiffEngine::isScaleTone(p, s.rootPitchClass, s.scale))
+            continue;
+        const int d = std::abs(p - pitch);
+        if (d < bestDistance) {
+            best = p;
+            bestDistance = d;
+        }
+    }
+    return best;
+}
+
+bool chordContainsPc(const PadSettings& s, int rootDegree, int pc) {
+    const auto& scale = RiffEngine::scaleDefinition(s.scale);
+    for (int offset : {0, 2, 4}) {
+        const int degree = (rootDegree + offset) % scale.count;
+        if (degreePc(s, degree) == wrap12(pc))
+            return true;
+    }
+    return false;
+}
+
+int chooseContextRootDegree(const Phrase& guitar,
+                            const Phrase& bass,
+                            const PadSettings& s,
+                            int startStep,
+                            int spanSteps,
+                            int fallbackDegree) {
+    const auto& scale = RiffEngine::scaleDefinition(s.scale);
+    int bestDegree = fallbackDegree;
+    double bestScore = -1.0;
+    bool sawContext = false;
+
+    for (int candidate = 0; candidate < scale.count; ++candidate) {
+        double score = candidate == fallbackDegree ? 0.20 : 0.0;
+
+        for (int offset = 0; offset < spanSteps; ++offset) {
+            const int step = startStep + offset;
+            if (step >= guitar.usedSteps() && step >= bass.usedSteps())
+                break;
+
+            const bool strong = (step % 4) == 0;
+
+            if (step < bass.usedSteps() && bass.steps[step].noteCount > 0) {
+                sawContext = true;
+                const int pc = bass.steps[step].notes[0].pitch;
+                if (chordContainsPc(s, candidate, pc))
+                    score += strong ? 3.0 : 2.0;
+                if (degreePc(s, candidate) == wrap12(pc))
+                    score += strong ? 1.5 : 0.5;
+            }
+
+            if (step < guitar.usedSteps() && guitar.steps[step].noteCount > 0) {
+                sawContext = true;
+                const int pc = guitar.steps[step].notes[0].pitch;
+                if (chordContainsPc(s, candidate, pc))
+                    score += strong ? 2.0 : 1.0;
+                if (degreePc(s, candidate) == wrap12(pc))
+                    score += strong ? 0.8 : 0.2;
+            }
+        }
+
+        if (score > bestScore) {
+            bestScore = score;
+            bestDegree = candidate;
+        }
+    }
+
+    return sawContext ? bestDegree : fallbackDegree;
+}
+
+void sortVoicing(PadStep& step) {
+    std::sort(step.notes.begin(), step.notes.begin() + step.noteCount,
+              [](const PadNote& a, const PadNote& b) { return a.pitch < b.pitch; });
+}
+
+} // namespace
+
+PadPhrase PadBrain::generate(const Phrase& guitar,
+                             const Phrase& bass,
+                             const PadSettings& settings,
+                             uint32_t seed) {
+    PadSettings s = settings;
+    s.rootPitchClass = wrap12(s.rootPitchClass);
+    s.movement = std::clamp(s.movement, 0.0f, 1.0f);
+    s.spread = std::clamp(s.spread, 0.0f, 1.0f);
+    s.tension = std::clamp(s.tension, 0.0f, 1.0f);
+    s.sustain = std::clamp(s.sustain, 0.0f, 1.0f);
+    s.contextFollow = std::clamp(s.contextFollow, 0.0f, 1.0f);
+    s.centerMidi = std::clamp(s.centerMidi, 48, 72);
+
+    PadPhrase out{};
+    out.bars = std::clamp(std::max(guitar.bars, bass.bars), 1, kMaxBars);
+
+    Rng rng(seed);
+    Rng contextRng(seed ^ 0x434F4E54u);
+    const auto& scale = RiffEngine::scaleDefinition(s.scale);
+
+    int chordEverySteps=16;
+    float halfBarProbability=0.06f+0.70f*s.movement;
+    switch(s.style){
+        case StyleId::HeavyIndustrial:halfBarProbability=0.12f+0.78f*s.movement;break;
+        case StyleId::DarkRockGothic:halfBarProbability=0.04f+0.62f*s.movement;break;
+        case StyleId::ClassicHeavy:halfBarProbability=0.04f+0.55f*s.movement;break;
+        case StyleId::Thrash:halfBarProbability=0.02f+0.45f*s.movement;break;
+        case StyleId::Groove:halfBarProbability=0.05f+0.55f*s.movement;break;
+        case StyleId::Death:halfBarProbability=0.02f+0.40f*s.movement;break;
+        case StyleId::MelodicDeath:halfBarProbability=0.08f+0.72f*s.movement;break;
+        case StyleId::Metalcore:halfBarProbability=0.05f+0.60f*s.movement;break;
+        case StyleId::NuMetal:halfBarProbability=0.03f+0.48f*s.movement;break;
+        case StyleId::Doom:halfBarProbability=0.01f+0.30f*s.movement;break;
+        case StyleId::DjentProgressive:halfBarProbability=0.06f+0.65f*s.movement;break;
+        default:break;
+    }
+
+    // Movement should react progressively: lower values mostly hold whole-bar
+    // harmony, higher values increasingly introduce half-bar changes.
+    chordEverySteps = rng.chance(std::clamp(halfBarProbability, 0.0f, 0.96f))
+        ? 8 : 16;
+
+    const std::array<int, 8> progression{{0, 5, 2, 6, 0, 3, 1, 4}};
+    std::array<int, kMaxPadVoices> previous{{-1, -1, -1, -1}};
+
+    for (int step = 0; step < out.usedSteps(); step += chordEverySteps) {
+        const int chordIndex = step / chordEverySteps;
+        int rootDegree = progression[static_cast<size_t>(chordIndex % progression.size())] %
+                         std::max(1, scale.count);
+
+        float progressionMoveChance=1.0f;
+        switch(s.style){
+            case StyleId::NDHIndustrial:progressionMoveChance=0.22f+0.38f*s.movement;break;
+            case StyleId::Thrash:progressionMoveChance=0.18f+0.30f*s.movement;break;
+            case StyleId::Death:progressionMoveChance=0.16f+0.28f*s.movement;break;
+            case StyleId::Metalcore:progressionMoveChance=0.22f+0.32f*s.movement;break;
+            case StyleId::NuMetal:progressionMoveChance=0.15f+0.25f*s.movement;break;
+            case StyleId::Doom:progressionMoveChance=0.12f+0.22f*s.movement;break;
+            case StyleId::DjentProgressive:progressionMoveChance=0.20f+0.35f*s.movement;break;
+            default:break;
+        }
+        if(chordIndex>0&&progressionMoveChance<0.999f&&!rng.chance(progressionMoveChance))
+            rootDegree=0;
+
+        // Context Follow makes the pad harmonically serve the actual riff.
+        // It only chooses the diatonic chord root; voicing, movement, tension
+        // and sustain remain independent pad decisions.
+        if (contextRng.chance(s.contextFollow)) {
+            rootDegree = chooseContextRootDegree(
+                guitar, bass, s, step, chordEverySteps, rootDegree);
+        }
+
+        std::array<int, 3> degrees{{
+            rootDegree,
+            (rootDegree + 2) % scale.count,
+            (rootDegree + 4) % scale.count
+        }};
+
+        // Pads deliberately stay sparse: normally 2-3 distinct chord tones.
+        // A possible fourth voice is added later only as an octave doubling.
+        int harmonicVoices = 3;
+        const float contextRichness = 1.0f - s.contextFollow;
+        if (s.style == StyleId::NDHIndustrial) {
+            // NDH deliberately remains sparse even with strong context-follow.
+            // Context-follow can enrich the voicing, but must not erase the
+            // style's characteristic two-note/power-like pad language.
+            const float twoToneProbability =
+                0.20f + 0.35f * contextRichness;
+            if (rng.chance(twoToneProbability))
+                harmonicVoices = 2;
+        } else if (s.style == StyleId::HeavyIndustrial) {
+            const float twoToneProbability=0.08f+0.20f*contextRichness;
+            if(rng.chance(twoToneProbability)) harmonicVoices=2;
+        } else if (s.style==StyleId::Thrash||s.style==StyleId::Death||s.style==StyleId::DjentProgressive) {
+            if(rng.chance(0.45f+0.25f*contextRichness)) harmonicVoices=2;
+        } else if (s.style==StyleId::NuMetal) {
+            if(rng.chance(0.35f+0.30f*contextRichness)) harmonicVoices=2;
+        } else if (s.style==StyleId::Metalcore) {
+            if(rng.chance(0.25f+0.25f*contextRichness)) harmonicVoices=2;
+        } else if (s.style==StyleId::ClassicHeavy) {
+            if(rng.chance(0.15f+0.15f*contextRichness)) harmonicVoices=2;
+        } else if (s.style==StyleId::MelodicDeath) {
+            if(rng.chance(0.10f+0.10f*contextRichness)) harmonicVoices=2;
+        }
+
+        auto& dst = out.steps[step];
+        dst.noteCount = harmonicVoices;
+
+        // Pads are sustained harmonic beds, not plucked notes. Their generated
+        // duration therefore reaches the next chord boundary. The processor
+        // applies the deliberate 1/64-note release gap at scheduling time.
+        // Do not shorten this with the internal sustain scalar: doing so made
+        // audible holes of several 16th notes between pad chords.
+        const int duration = std::min(chordEverySteps, out.usedSteps() - step);
+
+        for (int v = 0; v < harmonicVoices; ++v) {
+            int pc = degreePc(s, degrees[v]);
+            int target = s.centerMidi + (v - 1) * 5;
+            if (v == 0)
+                target -= 7;
+
+            int pitch = nearestPitchForPc(pc, target);
+
+            // Voice leading: prefer the closest inversion to the previous voice.
+            if (previous[v] >= 0) {
+                int best = pitch;
+                int bestDistance = std::abs(pitch - previous[v]);
+                for (int octave : {-12, 12}) {
+                    const int candidate = pitch + octave;
+                    if (candidate < 45 || candidate > 88)
+                        continue;
+                    const int d = std::abs(candidate - previous[v]);
+                    if (d < bestDistance) {
+                        best = candidate;
+                        bestDistance = d;
+                    }
+                }
+                pitch = best;
+            }
+
+            if (v >= 2 && pitch + 12 <= 88) {
+                const float voiceBias = (v == 2) ? -0.08f : 0.10f;
+                const float openProbability =
+                    std::clamp(0.10f + 0.78f * s.spread + voiceBias, 0.0f, 0.96f);
+                if (rng.chance(openProbability))
+                    pitch += 12;
+            }
+
+            // Tension remains scale-safe: color voice may move to the adjacent
+            // scale degree instead of using chromatic out-of-key notes.
+            if (v == harmonicVoices - 1 && rng.chance(0.15f + 0.55f * s.tension)) {
+                const int colorDegree = (degrees[v] + 1) % scale.count;
+                pitch = nearestPitchForPc(degreePc(s, colorDegree), pitch);
+            }
+
+            pitch = nearestScaleTone(std::clamp(pitch, 45, 88), s);
+            previous[v] = pitch;
+
+            int velocity=66+(v==0?7:0);
+            switch(s.style){
+                case StyleId::HeavyIndustrial:velocity+=5;break; case StyleId::DarkRockGothic:velocity-=3;break;
+                case StyleId::Thrash:velocity-=5;break; case StyleId::Death:velocity-=4;break;
+                case StyleId::MelodicDeath:velocity+=1;break; case StyleId::Metalcore:velocity+=2;break;
+                case StyleId::NuMetal:velocity-=2;break; case StyleId::Doom:velocity-=5;break;
+                case StyleId::DjentProgressive:velocity-=2;break; default:break;
+            }
+
+            dst.notes[v] = {pitch, std::clamp(velocity, 1, 126), duration};
+        }
+
+        // At most one additional pad voice, and only as a true octave
+        // doubling of an existing harmonic tone. This adds size without
+        // inventing a fourth independent chord degree.
+        // Octave doubling is deliberately occasional. Pads normally stay
+        // at 2-3 sounding notes; Spread may make an octave copy more likely,
+        // but even the widest setting must not turn four-note pads into the norm.
+        float octaveDoubleProbability = 0.02f + 0.08f * s.spread;
+        switch(s.style){
+            case StyleId::DarkRockGothic:octaveDoubleProbability+=0.04f;break;
+            case StyleId::HeavyIndustrial:octaveDoubleProbability+=0.02f;break;
+            case StyleId::ClassicHeavy:octaveDoubleProbability+=0.02f;break;
+            case StyleId::MelodicDeath:octaveDoubleProbability+=0.03f;break;
+            case StyleId::Doom:octaveDoubleProbability+=0.05f;break;
+            default:break;
+        }
+
+        if (harmonicVoices < kMaxPadVoices &&
+            rng.chance(std::clamp(octaveDoubleProbability, 0.0f, 0.16f))) {
+            const int sourceIndex =
+                (harmonicVoices > 2 && rng.chance(0.35f)) ? harmonicVoices - 1 : 0;
+            const auto source = dst.notes[sourceIndex];
+
+            int doubledPitch = source.pitch;
+            const bool canUp = source.pitch + 12 <= 88;
+            const bool canDown = source.pitch - 12 >= 45;
+
+            if (canUp && canDown)
+                doubledPitch += rng.chance(0.68f) ? 12 : -12;
+            else if (canUp)
+                doubledPitch += 12;
+            else if (canDown)
+                doubledPitch -= 12;
+
+            if (doubledPitch != source.pitch) {
+                dst.notes[dst.noteCount++] = {
+                    doubledPitch,
+                    std::clamp(source.velocity - 4, 1, 126),
+                    duration
+                };
+            }
+        }
+
+        sortVoicing(dst);
+    }
+
+    return out;
+}
+
+} // namespace midiator
