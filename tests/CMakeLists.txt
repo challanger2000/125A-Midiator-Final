@@ -157,4 +157,9 @@ target_compile_definitions(
         MIDIATOR_DEMO_BUILD=1
 )
 target_link_libraries(MidiatorDemoProcessorTests PRIVATE sdk vstgui_support)
+if(WIN32)
+    target_sources(MidiatorDemoProcessorTests PRIVATE
+        ${vst3sdk_SOURCE_DIR}/public.sdk/source/main/dllmain.cpp
+    )
+endif()
 add_test(NAME MidiatorDemoProcessorTests COMMAND MidiatorDemoProcessorTests)
