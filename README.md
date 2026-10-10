@@ -26,6 +26,8 @@
 
 See [Installation (DE)](docs/INSTALL_DE.md) / [Installation (EN)](docs/INSTALL_EN.md), and [Manual (DE)](docs/MANUAL_DE.md) / [Manual (EN)](docs/MANUAL_EN.md).
 
+See also [Gumroad distribution manifest](GUMROAD-RELEASE.md), [release notes](RELEASE-NOTES.md) and [third-party license notices](docs/THIRD_PARTY_NOTICES.md).
+
 Install the complete `125A Midiator.vst3` folder in `C:\\Program Files\\Common Files\\VST3\\`, then rescan VST3 plug-ins in your host. The binary is supplied separately as part of the official customer ZIP; the source repository is not an installer.
 
 **Important:** Not every DAW exposes all five VST3 MIDI outputs to other instruments. MIDI-only plug-in support and routing must be checked against the chosen host; do not assume compatibility from VST3 support alone.
