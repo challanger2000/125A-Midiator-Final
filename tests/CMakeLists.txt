@@ -138,3 +138,23 @@ add_executable(MidiatorDemoTimerTests
 )
 target_include_directories(MidiatorDemoTimerTests PRIVATE ../src)
 add_test(NAME MidiatorDemoTimerTests COMMAND MidiatorDemoTimerTests)
+
+
+add_executable(MidiatorDemoProcessorTests
+    DemoProcessorTests.cpp
+    ../src/PluginProcessor.cpp
+    ../src/GuitarBrain.cpp
+    ../src/BassBrain.cpp
+    ../src/DrumBrain.cpp
+    ../src/PadBrain.cpp
+    ../src/SynthBrain.cpp
+)
+target_include_directories(MidiatorDemoProcessorTests PRIVATE ../src)
+target_compile_definitions(
+    MidiatorDemoProcessorTests
+    PRIVATE
+        MIDIATOR_NO_FACTORY=1
+        MIDIATOR_DEMO_BUILD=1
+)
+target_link_libraries(MidiatorDemoProcessorTests PRIVATE sdk vstgui_support)
+add_test(NAME MidiatorDemoProcessorTests COMMAND MidiatorDemoProcessorTests)
